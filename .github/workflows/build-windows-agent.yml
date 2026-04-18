@@ -1,5 +1,6 @@
 name: Build ThermopacAgent Windows Installer
 
+
   on:
     workflow_dispatch:
       inputs:
