@@ -16,6 +16,9 @@ on:
     branches:
       - main
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     name: Build on Windows
@@ -51,7 +54,6 @@ jobs:
             --distpath dist `
             --workpath build `
             --specpath . `
-            --add-data "config.ini;." `
             --add-data "extractor;extractor" `
             --add-data "agent;agent" `
             --hidden-import win32com `
