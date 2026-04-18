@@ -37,7 +37,7 @@ SW_VERSION_PROGID = {
 }
 
 _TOKEN_PLACEHOLDER = "REPLACE_WITH_YOUR_TOKEN"
-_DEFAULT_API_URL   = "http://localhost:3000"
+_DEFAULT_API_URL   = "https://thermopac-communication-thermopacllp.replit.app"
 
 
 class AgentConfig:
@@ -45,12 +45,21 @@ class AgentConfig:
         if path is None:
             path = self._default_path()
 
-        # Auto-create config.ini if missing
+        # Auto-create config.ini if missing at the single canonical path
         if not os.path.exists(path):
             _create_default_config(path)
 
+        print(f"[CONFIG] Loaded from: {path}")
+
         cfg = configparser.ConfigParser()
         cfg.read(path, encoding="utf-8")
+
+        # Print api_url immediately after reading so it's visible before any other logic
+        _early_api_url = (
+            cfg.get("cloud", "api_url", fallback="").strip().rstrip("/")
+            or _DEFAULT_API_URL
+        )
+        print(f"[CONFIG] api_url:      {_early_api_url}")
 
         # ── Mode ──────────────────────────────────────────────────────────────
         raw_mode = cfg.get("agent", "mode", fallback="testing").strip().lower()
@@ -141,19 +150,23 @@ class AgentConfig:
 
     @staticmethod
     def _default_path() -> str:
+        """
+        Single source of truth for config location.
+
+        Frozen (installed EXE):
+          → same folder as ThermopacAgent.exe
+          → e.g. C:\\Program Files\\ThermopacAgent\\config.ini
+
+        Source / dev:
+          → project root (parent of the agent/ package)
+        """
         if getattr(sys, "frozen", False):
+            # sys.executable = C:\Program Files\ThermopacAgent\ThermopacAgent.exe
             base = os.path.dirname(sys.executable)
         else:
+            # __file__ = <project>/agent/config.py  →  parent = <project>/
             base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        candidates = [
-            os.path.join(base, "config.ini"),
-            os.path.join(base, "..", "config.ini"),
-            r"C:\ThermopacAgent\config.ini",
-        ]
-        for p in candidates:
-            if os.path.exists(os.path.normpath(p)):
-                return os.path.normpath(p)
-        return os.path.normpath(candidates[0])
+        return os.path.normpath(os.path.join(base, "config.ini"))
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
