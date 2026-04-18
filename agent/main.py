@@ -54,6 +54,62 @@ BANNER = r"""
 _shutdown = False
 
 
+def _auto_register_node(config, logger) -> bool:
+    """
+    Testing mode only.
+    POST /api/epc-agent-nodes/auto-register to self-register with the cloud.
+    The cloud accepts this only when AGENT_AUTO_REGISTER=true is set server-side.
+    Returns True on success, False on failure.
+    """
+    import requests as _requests
+    url  = f"{config.api_url}/api/epc-agent-nodes/auto-register"
+    body = {
+        "node_id":       config.node_id,
+        "node_token":    config.node_token,
+        "machine_name":  socket.gethostname(),
+        "agent_version": AGENT_VERSION,
+    }
+    logger.info(f"[AutoReg] Registering node '{config.node_id}' with cloud (testing mode)…")
+    try:
+        r = _requests.post(url, json=body, timeout=15)
+        if r.status_code == 200:
+            logger.info(f"[AutoReg] Node '{config.node_id}' registered successfully")
+            print(f"[AutoReg] Node '{config.node_id}' registered with cloud.")
+            return True
+        if r.status_code == 403:
+            logger.error(
+                "[AutoReg] Cloud rejected auto-registration — server is in production mode.\n"
+                "          Set AGENT_AUTO_REGISTER=true on the server to enable testing mode,\n"
+                "          OR set [agent] mode = production in config.ini and use an admin-issued token."
+            )
+            return False
+        logger.error(f"[AutoReg] Registration failed: HTTP {r.status_code} — {r.text[:300]}")
+        return False
+    except Exception as e:
+        logger.error(f"[AutoReg] Registration request failed: {e}")
+        logger.error(f"[AutoReg] Is the cloud running at {config.api_url}?")
+        return False
+
+
+def _print_startup_config(config) -> None:
+    """Print a clear summary of all config values, flagging auto-filled ones."""
+    auto = "[auto]"
+    print("-" * 62)
+    print(f"  api_url    : {config.api_url}"
+          + (f"  {auto} change for production" if "localhost" in config.api_url else ""))
+    print(f"  node_id    : {config.node_id}")
+    print(f"  node_token : {'*' * 8}  (set)")
+    if config.sw_progid:
+        tag = f"  {auto} detected" if getattr(config, "sw_autodetected", False) else ""
+        print(f"  solidworks : {config.sw_progid}{tag}")
+    else:
+        print("  solidworks : NOT DETECTED")
+        print("               WARNING: extraction jobs will fail until SolidWorks")
+        print("               is installed and solidworks_version is set in config.ini")
+    print("-" * 62)
+    print()
+
+
 def _handle_signal(signum, frame):
     global _shutdown
     print("\n[Agent] Shutdown signal received — finishing current job then stopping…")
@@ -92,6 +148,9 @@ def main():
     if args.node_token:
         config.node_token = args.node_token
 
+    # ── Startup config summary ────────────────────────────────────────────────
+    _print_startup_config(config)
+
     # ── Logger ────────────────────────────────────────────────────────────────
     logger = build_logger(config.log_dir)
     logger.info(f"[Agent] Starting — {config.summary()}")
@@ -99,6 +158,11 @@ def main():
 
     # ── HTTP client ───────────────────────────────────────────────────────────
     client = JobClient(config.api_url, config.node_id, config.node_token, logger)
+
+    # ── Auto-registration (testing mode only) ─────────────────────────────────
+    if config.mode == "testing" and config.token_auto_generated:
+        if not _auto_register_node(config, logger):
+            sys.exit(1)
 
     # ── Test mode ─────────────────────────────────────────────────────────────
     if args.test or args.test_full:
