@@ -83,11 +83,13 @@ begin
   begin
     CreateScheduledTask();
     MsgBox('Installation complete!' + #13#10 + #13#10 +
-           'Before starting the agent:' + #13#10 +
-           '1. Edit config.ini in ' + ExpandConstant('{app}') + #13#10 +
-           '2. Set your node_id and node_token from the Thermopac admin panel' + #13#10 +
-           '3. Set solidworks_version to match your installed version' + #13#10 + #13#10 +
-           'Then launch ThermopacAgent from the Start Menu or Desktop shortcut.',
+           'Agent will auto-configure on first run:' + #13#10 +
+           '  - node_id auto-filled from machine name' + #13#10 +
+           '  - SolidWorks version auto-detected from registry' + #13#10 +
+           '  - Testing mode: token auto-generated and self-registered' + #13#10 + #13#10 +
+           'Production mode only:' + #13#10 +
+           '  Set node_token in config.ini (admin-issued token required).' + #13#10 + #13#10 +
+           'Launch ThermopacAgent from the Start Menu or Desktop shortcut.',
            mbInformation, MB_OK);
   end;
 end;
