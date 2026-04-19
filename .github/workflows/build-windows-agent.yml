@@ -1,0 +1,154 @@
+name: Build ThermopacAgent Windows Installer
+
+  on:
+    workflow_dispatch:
+      inputs:
+        version:
+          description: 'Agent version (e.g. 1.0.0)'
+          required: true
+          default: '1.0.0'
+    push:
+      paths:
+        - 'agent/**'
+        - 'extractor/**'
+        - 'installer/**'
+      branches:
+        - main
+
+  env:
+    FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+  jobs:
+    build:
+      name: Build on Windows
+      runs-on: windows-latest
+
+      steps:
+        - name: Checkout repository
+          uses: actions/checkout@v4
+
+        - name: Set up Python 3.11
+          uses: actions/setup-python@v5
+          with:
+            python-version: '3.11'
+            architecture: 'x64'
+
+        - name: Install Python dependencies
+          run: |
+            python -m pip install --upgrade pip
+            pip install pywin32 requests pyinstaller pywin32-ctypes
+
+        - name: Build EXE with PyInstaller
+          run: |
+            pyinstaller `
+              --name ThermopacAgent `
+              --onedir `
+              --console `
+              --clean `
+              --noconfirm `
+              --distpath dist `
+              --workpath build `
+              --specpath . `
+              --add-data "extractor;extractor" `
+              --add-data "agent;agent" `
+              --hidden-import win32com `
+              --hidden-import win32com.client `
+              --hidden-import pythoncom `
+              --hidden-import pywintypes `
+              --hidden-import win32api `
+              --hidden-import win32con `
+              --hidden-import requests `
+              --hidden-import configparser `
+              --paths agent `
+              --paths extractor `
+              agent\main.py
+
+        - name: Verify EXE
+          run: |
+            $exe = "dist\ThermopacAgent\ThermopacAgent.exe"
+            if (!(Test-Path $exe)) {
+              Write-Error "ThermopacAgent.exe not found: $exe"
+              Get-ChildItem dist -Recurse -ErrorAction SilentlyContinue
+              exit 1
+            }
+            $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+            Write-Host "EXE found: $exe ($sizeMB MB)"
+
+        - name: Run agent self-test (--test mode)
+          env:
+            THERMOPAC_API_URL: ${{ secrets.THERMOPAC_API_URL }}
+            THERMOPAC_NODE_ID: ${{ secrets.THERMOPAC_NODE_ID }}
+            THERMOPAC_NODE_TOKEN: ${{ secrets.THERMOPAC_NODE_TOKEN }}
+          run: |
+            & "dist\ThermopacAgent\ThermopacAgent.exe" --test `
+              --api-url    "$env:THERMOPAC_API_URL" `
+              --node-id    "$env:THERMOPAC_NODE_ID" `
+              --node-token "$env:THERMOPAC_NODE_TOKEN"
+          continue-on-error: true
+
+        - name: Install Inno Setup 6
+          run: |
+            $out = "$env:TEMP\innosetup.exe"
+            Invoke-WebRequest -Uri "https://jrsoftware.org/download.php/is.exe" -OutFile $out
+            Start-Process -FilePath $out -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait
+            Write-Host "Inno Setup installed"
+
+        - name: Patch version in setup.iss
+          run: |
+            $version = "${{ github.event.inputs.version || '1.0.0' }}"
+            (Get-Content "installer\setup.iss") `
+              -replace '#define AppVersion\s+"[^"]+"', "#define AppVersion      `"$version`"" |
+              Set-Content "installer\setup.iss"
+            Write-Host "Version patched to: $version"
+
+        - name: Build Inno Setup installer
+          run: |
+            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+            if (!(Test-Path $iscc)) { $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe" }
+            if (!(Test-Path $iscc)) {
+              Write-Error "ISCC.exe not found"
+              exit 1
+            }
+            & $iscc "installer\setup.iss"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "ISCC failed with exit code $LASTEXITCODE"
+              exit 1
+            }
+
+        - name: Verify installer
+          run: |
+            $version = "${{ github.event.inputs.version || '1.0.0' }}"
+            $installer = "installer_output\ThermopacAgent-Setup-v$version.exe"
+            if (!(Test-Path $installer)) {
+              Get-ChildItem installer_output -ErrorAction SilentlyContinue
+              Write-Error "Installer not found: $installer"
+              exit 1
+            }
+            $sizeMB = [math]::Round((Get-Item $installer).Length / 1MB, 1)
+            Write-Host "Installer: $installer ($sizeMB MB)"
+
+        - name: Compute checksums
+          run: |
+            $version = "${{ github.event.inputs.version || '1.0.0' }}"
+            $installer = "installer_output\ThermopacAgent-Setup-v$version.exe"
+            $hash = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLower()
+            Write-Host "SHA-256: $hash"
+            "$hash  ThermopacAgent-Setup-v$version.exe" |
+              Out-File "installer_output\SHA256SUMS.txt" -Encoding utf8
+
+        - name: Upload installer artifact
+          uses: actions/upload-artifact@v4
+          with:
+            name: ThermopacAgent-Setup-v${{ github.event.inputs.version || '1.0.0' }}
+            path: |
+              installer_output/ThermopacAgent-Setup-v*.exe
+              installer_output/SHA256SUMS.txt
+            retention-days: 30
+
+        - name: Upload dist artifact
+          uses: actions/upload-artifact@v4
+          with:
+            name: ThermopacAgent-dist-v${{ github.event.inputs.version || '1.0.0' }}
+            path: dist/ThermopacAgent/
+            retention-days: 7
+  
