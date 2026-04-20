@@ -1,9 +1,9 @@
 @echo off
 setlocal
-title ThermopacAgent v1.0.29 - Updater
+title ThermopacAgent v1.0.30 - Updater
 
 echo ============================================================
-echo  ThermopacAgent v1.0.29 - Auto Updater
+echo  ThermopacAgent v1.0.30 - Auto Updater
 echo  Updates an existing installation in-place.
 echo ============================================================
 echo.
@@ -38,19 +38,19 @@ echo.
 :: ── Copy updated files ────────────────────────────────────────────────────────
 echo Copying agent\  ...
 xcopy /E /I /Y "%~dp0agent" "%INSTALL_DIR%\agent\" >nul
-if errorlevel 1 ( echo   WARNING: agent copy had errors & )
+if errorlevel 1 ( echo   WARNING: agent copy had errors )
 
 echo Copying extractor\  ...
 xcopy /E /I /Y "%~dp0extractor" "%INSTALL_DIR%\extractor\" >nul
-if errorlevel 1 ( echo   WARNING: extractor copy had errors & )
+if errorlevel 1 ( echo   WARNING: extractor copy had errors )
 
 echo Copying run.bat  ...
-copy /Y "%~dp0installer\run.bat" "%INSTALL_DIR%\run.bat" >nul
-if errorlevel 1 ( echo   WARNING: run.bat copy had errors & )
+copy /Y "%~dp0run.bat" "%INSTALL_DIR%\run.bat" >nul
+if errorlevel 1 ( echo   WARNING: run.bat copy had errors )
 
 echo.
 echo ============================================================
-echo  Update complete!  v1.0.29 is now installed.
+echo  Update complete!  v1.0.30 is now installed.
 echo ============================================================
 echo.
 
