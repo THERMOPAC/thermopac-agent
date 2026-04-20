@@ -11,7 +11,7 @@
 ;   - dist\python\          Python 3.11 embeddable (downloaded by build-installer.bat)
 
 #define AppName      "ThermopacAgent"
-#define AppVersion   "1.0.28"
+#define AppVersion   "1.0.27"
 #define AppPublisher "Thermopac"
 #define AppURL       "https://thermopac-communication-thermopacllp.replit.app"
 #define AppExeName   "run.bat"
@@ -158,36 +158,6 @@ begin
   end;
 end;
 
-// ── Kill any running agent before files are touched ───────────────────────
-// PrepareToInstall runs before file extraction; errors here abort the install
-// with a message.  We use it to cleanly stop the agent so run.bat / python.exe
-// are not locked (error 32) when the installer tries to overwrite them.
-procedure KillRunningAgent();
-var
-  ResultCode: Integer;
-begin
-  // Stop the scheduled task politely first (non-fatal)
-  Exec('schtasks.exe', '/End /TN "ThermopacAgent"',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  // Force-kill all cmd.exe windows whose title contains ThermopacAgent
-  Exec('taskkill.exe', '/F /FI "WINDOWTITLE eq ThermopacAgent*" /T',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  // Force-kill python.exe processes running from the install folder
-  // (Targets any pythonw.exe / python.exe regardless of window)
-  Exec('taskkill.exe', '/F /FI "IMAGENAME eq python.exe" /T',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec('taskkill.exe', '/F /FI "IMAGENAME eq pythonw.exe" /T',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  // Give Windows a moment to release file handles before extraction starts
-  Sleep(1500);
-end;
-
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-begin
-  KillRunningAgent();
-  Result := '';   // empty string = continue install
-end;
-
 // ── Validation ────────────────────────────────────────────────────────────
 function InitializeSetup(): Boolean;
 begin
@@ -262,9 +232,6 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ResultCode: Integer;
 begin
-  if CurUninstallStep = usUninstall then
-    // Kill the agent before files are removed (same reason as PrepareToInstall)
-    KillRunningAgent();
   if CurUninstallStep = usPostUninstall then
     Exec('schtasks.exe', '/Delete /F /TN "ThermopacAgent"',
          '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
