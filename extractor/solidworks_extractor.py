@@ -396,8 +396,29 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         else:
             logger.info(f"[Extractor] Document open OK in full mode (pass={pass_num})")
 
-        # SolidWorks DrawingDoc interface
-        swDraw = swModel  # IDrawingDoc is the same COM object for .slddrw
+        # ── Verify document type ───────────────────────────────────────────────
+        # swDocumentTypes_e: 1=Part, 2=Assembly, 3=Drawing
+        try:
+            doc_type = swModel.GetType()
+            type_name = {1: "Part", 2: "Assembly", 3: "Drawing"}.get(doc_type, f"Unknown({doc_type})")
+            logger.info(f"[Extractor] Model type: {doc_type} ({type_name})")
+            if doc_type != 3:
+                raise RuntimeError(f"Expected swDocDRAWING (3) but got type {doc_type}. Wrong file type.")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.warning(f"[Extractor] GetType() failed: {e}")
+
+        # ── QueryInterface to IDrawingDoc ─────────────────────────────────────
+        # OpenDoc returns IModelDoc2. Drawing-specific methods (GetCurrentSheet,
+        # GetFirstView, GetNextView, ActivateSheet) are defined on IDrawingDoc,
+        # not IModelDoc2. CastTo() performs a COM QueryInterface to that interface.
+        swDraw = swModel  # safe fallback (IModelDoc2)
+        try:
+            swDraw = win32com.client.CastTo(swModel, "IDrawingDoc")
+            logger.info("[Extractor] CastTo IDrawingDoc: OK — drawing-specific methods available")
+        except Exception as e:
+            logger.warning(f"[Extractor] CastTo IDrawingDoc failed ({e}); using IModelDoc2")
 
         # ── Run modules ───────────────────────────────────────────────────────
         modules = [
