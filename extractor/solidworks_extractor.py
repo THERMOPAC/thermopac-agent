@@ -105,19 +105,9 @@ def _prepare_sw_makepy_cache(progid: str, logger) -> None:
             "Run: pip install pywin32   then: python -m win32com.client.makepy"
         )
 
-    # ── Method A: ProgID → CLSID → TypeLib CLSID ─────────────────────────
-    try:
-        # Step 1: resolve CLSID from ProgID
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"{progid}\\CLSID") as k:
-            app_clsid = winreg.QueryValue(k, "")
-        logger.info(f"[Makepy-A] CLSID: {app_clsid}")
-
-        # Step 2: TypeLib CLSID from CLSID entry
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"CLSID\\{app_clsid}\\TypeLib") as k:
-            tl_clsid = winreg.QueryValue(k, "")
-        logger.info(f"[Makepy-A] TypeLib CLSID: {tl_clsid}")
-
-        # Step 3: enumerate available versions
+    def _enum_typelib_versions(tl_clsid: str):
+        """Return sorted list of (major, minor, ver_str) from TypeLib registry.
+        Non-numeric sub-keys (e.g. 'lib.3', 'Helpdir') are silently skipped."""
         versions = []
         with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"TypeLib\\{tl_clsid}") as k:
             i = 0
@@ -125,12 +115,34 @@ def _prepare_sw_makepy_cache(progid: str, logger) -> None:
                 try:
                     ver_str = winreg.EnumKey(k, i); i += 1
                     parts = ver_str.split(".")
-                    versions.append((int(parts[0]), int(parts[1]) if len(parts) > 1 else 0, ver_str))
+                    try:
+                        maj = int(parts[0])
+                        min_ = int(parts[1]) if len(parts) > 1 else 0
+                        versions.append((maj, min_, ver_str))
+                    except ValueError:
+                        # sub-key is not a version number (e.g. 'lb.3', 'FLAGS')
+                        logger.debug(f"[Makepy] Skipping non-numeric TypeLib sub-key: {ver_str!r}")
                 except OSError:
                     break
+        return sorted(versions)
+
+    def _resolve_tl_clsid(progid: str):
+        """ProgID → app CLSID → TypeLib CLSID"""
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"{progid}\\CLSID") as k:
+            app_clsid = winreg.QueryValue(k, "")
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"CLSID\\{app_clsid}\\TypeLib") as k:
+            tl_clsid = winreg.QueryValue(k, "")
+        return app_clsid, tl_clsid
+
+    # ── Method A: ProgID → CLSID → TypeLib CLSID → EnsureModule ─────────
+    try:
+        app_clsid, tl_clsid = _resolve_tl_clsid(progid)
+        logger.info(f"[Makepy-A] CLSID: {app_clsid}  TypeLib: {tl_clsid}")
+
+        versions = _enum_typelib_versions(tl_clsid)
         if not versions:
-            raise ValueError(f"No version subkeys under TypeLib\\{tl_clsid}")
-        major, minor, ver_str = sorted(versions)[-1]
+            raise ValueError(f"No numeric version sub-keys under TypeLib\\{tl_clsid}")
+        major, minor, ver_str = versions[-1]
         logger.info(f"[Makepy-A] TypeLib version: {major}.{minor}")
 
         win32com.client.gencache.EnsureModule(tl_clsid, 0, major, minor)
@@ -140,80 +152,75 @@ def _prepare_sw_makepy_cache(progid: str, logger) -> None:
     except Exception as e:
         logger.warning(f"[Makepy-A] Failed: {e}")
 
-    # ── Method B: Load TLB file directly (handles resource-embedded TLBs) ─
+    # ── Method B: registry TLB file path → LoadTypeLib → EnsureModule ────
     try:
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"{progid}\\CLSID") as k:
-            app_clsid = winreg.QueryValue(k, "")
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"CLSID\\{app_clsid}\\TypeLib") as k:
-            tl_clsid = winreg.QueryValue(k, "")
+        app_clsid, tl_clsid = _resolve_tl_clsid(progid)
+        versions = _enum_typelib_versions(tl_clsid)
+        if not versions:
+            raise ValueError(f"No numeric TypeLib version sub-keys for {tl_clsid}")
+        major, minor, ver_str = versions[-1]
 
-        versions = []
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"TypeLib\\{tl_clsid}") as k:
-            i = 0
-            while True:
-                try:
-                    ver_str = winreg.EnumKey(k, i); i += 1
-                    parts = ver_str.split(".")
-                    versions.append((int(parts[0]), int(parts[1]) if len(parts) > 1 else 0, ver_str))
-                except OSError:
-                    break
-        major, minor, ver_str = sorted(versions)[-1]
-
-        # Try each platform sub-key for the actual file path
+        found_path = None
         for arch in ("win64", "win32", ""):
             sub = f"TypeLib\\{tl_clsid}\\{ver_str}\\0"
             key_path = f"{sub}\\{arch}" if arch else sub
             try:
                 with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, key_path) as k:
-                    raw_path = winreg.QueryValue(k, "").strip('"').split(",")[0].strip()
-                if not os.path.isfile(raw_path):
-                    continue
-                logger.info(f"[Makepy-B] TLB file found: {raw_path}")
-                tl = pythoncom.LoadTypeLib(raw_path)
-                win32com.client.gencache.EnsureModule(
-                    tl_clsid, 0, major, minor, bForDemand=False, bBuildHidden=True)
-                logger.info("[Makepy-B] Success — early-binding cache seeded via TLB file")
-                return
-            except Exception:
+                    raw = winreg.QueryValue(k, "").strip('"').split(",")[0].strip()
+                if raw and os.path.isfile(raw):
+                    found_path = raw; break
+            except OSError:
                 continue
-        raise ValueError("No usable TLB file path found in registry")
+
+        if not found_path:
+            raise ValueError(f"No usable TLB file path in registry for {tl_clsid}")
+
+        logger.info(f"[Makepy-B] TLB file: {found_path}")
+        pythoncom.LoadTypeLib(found_path)
+        win32com.client.gencache.EnsureModule(
+            tl_clsid, 0, major, minor, bForDemand=False, bBuildHidden=True)
+        logger.info("[Makepy-B] Success — early-binding cache seeded via TLB file")
+        return
 
     except Exception as e:
         logger.warning(f"[Makepy-B] Failed: {e}")
 
-    # ── Method C: Walk known SOLIDWORKS install directories ───────────────
+    # ── Method C: SolidWorks install dir → scan for .tlb or sldworks.exe ─
     try:
         sw_dirs = []
-        for year in range(2024, 2018, -1):
-            for root in (winreg.HKEY_LOCAL_MACHINE,):
+        # Map Application.N to year (SW 2019 = .27, 2020 = .28, …)
+        for year in range(2024, 2016, -1):
+            for hive in (winreg.HKEY_LOCAL_MACHINE,):
                 for base in (
                     f"SOFTWARE\\SolidWorks\\SolidWorks {year}\\Setup",
                     f"SOFTWARE\\WOW6432Node\\SolidWorks\\SolidWorks {year}\\Setup",
                 ):
                     try:
-                        with winreg.OpenKey(root, base) as k:
+                        with winreg.OpenKey(hive, base) as k:
                             d = winreg.QueryValueEx(k, "SldWorks dir")[0]
-                            if d and os.path.isdir(d):
+                            if d and os.path.isdir(d) and d not in sw_dirs:
                                 sw_dirs.append(d)
                     except OSError:
                         pass
 
+        if not sw_dirs:
+            raise ValueError("SolidWorks install dir not found in registry")
+
         for sw_dir in sw_dirs:
-            candidates = (
-                [os.path.join(sw_dir, "sldworks.exe")]
-                + [os.path.join(sw_dir, f) for f in os.listdir(sw_dir)
-                   if f.lower().endswith(".tlb")]
-            )
+            # Prefer explicit .tlb files; fall back to resource-embedded in exe
+            tlb_files  = [f for f in os.listdir(sw_dir) if f.lower().endswith(".tlb")]
+            exe_files  = [f for f in os.listdir(sw_dir)
+                          if f.lower() in ("sldworks.exe", "sldworks_worker.exe")]
+            candidates = [os.path.join(sw_dir, f) for f in tlb_files + exe_files]
+
             for candidate in candidates:
                 if not os.path.isfile(candidate):
                     continue
                 try:
                     logger.info(f"[Makepy-C] Trying: {candidate}")
                     tl = pythoncom.LoadTypeLib(candidate)
-                    # Determine CLSID + version from loaded ITypeLib
                     tla = tl.GetLibAttr()
-                    clsid_c = str(tla[0])
-                    major_c = tla[3]; minor_c = tla[4]
+                    clsid_c = str(tla[0]); major_c = tla[3]; minor_c = tla[4]
                     win32com.client.gencache.EnsureModule(
                         clsid_c, 0, major_c, minor_c,
                         bForDemand=False, bBuildHidden=True)
@@ -228,14 +235,31 @@ def _prepare_sw_makepy_cache(progid: str, logger) -> None:
     except Exception as e:
         logger.warning(f"[Makepy-C] Failed: {e}")
 
-    # ── All methods failed ────────────────────────────────────────────────
-    raise RuntimeError(
-        "Cannot prepare win32com early-binding cache for SolidWorks.\n"
-        "Fix: run the installer's post-install makepy step, or manually:\n"
-        f'  python -m win32com.client.makepy "{progid}"\n'
-        "Then restart the agent.\n"
-        "If that also fails, re-run ThermopacAgent-Setup.exe and choose\n"
-        "'Re-run SolidWorks COM setup' in the advanced options."
+    # ── Method D: subprocess makepy as a last resort ──────────────────────
+    # Runs: python -m win32com.client.makepy "<progid>"
+    # in a subprocess so a crash there doesn't kill the agent process.
+    try:
+        import subprocess, sys
+        logger.info(f"[Makepy-D] Trying subprocess makepy for {progid}…")
+        result = subprocess.run(
+            [sys.executable, "-m", "win32com.client.makepy", progid],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0:
+            logger.info("[Makepy-D] Success — subprocess makepy completed")
+            return
+        raise RuntimeError(result.stderr.strip() or f"exit code {result.returncode}")
+
+    except Exception as e:
+        logger.warning(f"[Makepy-D] Failed: {e}")
+
+    # ── All makepy methods exhausted — log clearly, do NOT abort ─────────
+    # The EnsureDispatch call below will still attempt its own cache build.
+    # Many SolidWorks 2019-2021 installs work fine with late-binding Dispatch.
+    logger.warning(
+        "[Makepy] All cache-seeding methods failed — will attempt late-binding.\n"
+        "  To fix permanently run:  python -m win32com.client.makepy "
+        f'"{progid}"'
     )
 
 
@@ -397,16 +421,24 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         #
         # _prepare_sw_makepy_cache() tries three methods:
         #   A: ProgID → CLSID → TypeLib CLSID → gencache.EnsureModule
-        #   B: Walk TypeLib registry entries; find .tlb / .exe path; pass file
-        #      path directly to gencache.EnsureModule with a compat flag
-        #   C: Walk known SOLIDWORKS install-dir paths and load TLB from disk
-        # If all three fail the error is re-raised with clear user instructions.
+        #   B: registry TLB path  → LoadTypeLib → EnsureModule
+        #   C: SW install dir scan → LoadTypeLib → EnsureModule
+        #   D: subprocess python -m win32com.client.makepy
+        # Methods no longer hard-fail; they log warnings and fall through to
+        # the EnsureDispatch / Dispatch fallback below.
         _prepare_sw_makepy_cache(config.sw_progid, logger)
 
-        # EnsureDispatch finds the pre-seeded cache; CastTo(IDrawingDoc) works.
-        logger.info("[Extractor] Launching SolidWorks via gencache.EnsureDispatch…")
-        swApp = win32com.client.gencache.EnsureDispatch(config.sw_progid)
-        logger.info("[Extractor] SolidWorks COM instance ready (early-bound)")
+        # Prefer early-binding (EnsureDispatch uses pre-seeded cache).
+        # If makepy cache is still missing, fall back to late-binding Dispatch —
+        # it loses CastTo(IDrawingDoc) but OpenDoc6 + property bag still work.
+        logger.info("[Extractor] Connecting to SolidWorks COM…")
+        try:
+            swApp = win32com.client.gencache.EnsureDispatch(config.sw_progid)
+            logger.info("[Extractor] SolidWorks COM ready (early-bound)")
+        except Exception as ed:
+            logger.warning(f"[Extractor] EnsureDispatch failed ({ed}); trying late-binding Dispatch…")
+            swApp = win32com.client.Dispatch(config.sw_progid)
+            logger.info("[Extractor] SolidWorks COM ready (late-bound — limited CastTo support)")
         swApp.Visible = config.sw_visible
         swApp.UserControlBackground = True
         logger.info(f"[Extractor] SolidWorks ready ({time.monotonic() - t_launch:.1f}s)")
