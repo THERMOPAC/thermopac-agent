@@ -39,7 +39,30 @@ from extractor.extract_design_data   import ExtractDesignDataTable, DesignDataNo
 SW_DOC_DRAWING           = 3
 SW_OPEN_READ_ONLY        = 2
 SW_OPEN_SILENT           = 64
-SW_OPEN_LOAD_MODEL       = 128
+SW_OPEN_LOAD_MODEL       = 128   # NOT used — referenced parts are absent in temp dir
+
+# swOpenDocError_e decode map (for diagnostics)
+_SW_OPEN_ERRORS = {
+    1:       "GenericError",
+    2:       "FileNotFound",
+    4:       "LockedFile",
+    8:       "UserDeclined",
+    128:     "AlreadyOpen",
+    512:     "FileReadOnly",
+    1024:    "ConversionRequired",
+    4096:    "NeedToActivateDoc",
+    131072:  "GenRenderMat",
+    262144:  "IdMismatch",
+    524288:  "AddToCurrentDoc",
+    1048576: "SWXOnly",
+    2097152: "HeavyWeightComponents",  # referenced 3-D files missing from temp folder
+}
+
+def _decode_sw_error(code: int) -> str:
+    if code == 0:
+        return "0 (none)"
+    parts = [name for bit, name in _SW_OPEN_ERRORS.items() if code & bit]
+    return f"{code} ({', '.join(parts) if parts else 'unknown'})"
 
 
 def run_extraction(temp_path: str, config, cancel_event: threading.Event,
@@ -112,20 +135,33 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
 
         # ── Open document (read-only, silent) ─────────────────────────────────
         _check_cancel(cancel_event, "before OpenDoc6")
-        options = SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_LOAD_MODEL
-        # OpenDoc6 Errors/Warnings are ByRef Long — must use VARIANT(VT_BYREF|VT_I4)
-        # for late-bound COM (DispatchEx); plain Python int causes Type mismatch (0x80020005)
-        errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-        warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         logger.info(f"[Extractor] Opening: {temp_path}")
-        # OpenDoc6(FileName, Type, Options, Configuration, Errors, Warnings)
-        swModel = swApp.OpenDoc6(temp_path, SW_DOC_DRAWING, options, "", errors, warnings)
-        err_val  = errors.value
-        warn_val = warnings.value
+
+        # Pass 1: no SW_OPEN_LOAD_MODEL — drawing only, referenced parts not in temp dir
+        # Pass 2: fallback with SW_OPEN_LOAD_MODEL in case SW requires it for this file
+        swModel = None
+        for pass_num, options in enumerate(
+            [SW_OPEN_READ_ONLY | SW_OPEN_SILENT,
+             SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_LOAD_MODEL], start=1
+        ):
+            errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            swModel  = swApp.OpenDoc6(temp_path, SW_DOC_DRAWING, options, "", errors, warnings)
+            err_val  = errors.value
+            warn_val = warnings.value
+            logger.info(f"[Extractor] OpenDoc6 pass {pass_num}: "
+                        f"model={'OK' if swModel else 'None'} "
+                        f"errors={_decode_sw_error(err_val)} "
+                        f"warnings={_decode_sw_error(warn_val)}")
+            if swModel is not None:
+                break
+
         if swModel is None:
-            raise RuntimeError(f"OpenDoc6 returned None — cannot open {filename}. "
-                               f"Errors={err_val} Warnings={warn_val}")
-        logger.info(f"[Extractor] Document open (errors={err_val} warnings={warn_val})")
+            raise RuntimeError(
+                f"OpenDoc6 returned None — cannot open {filename}. "
+                f"Errors={_decode_sw_error(err_val)} Warnings={_decode_sw_error(warn_val)}"
+            )
+        logger.info(f"[Extractor] Document open OK")
 
         # SolidWorks DrawingDoc interface
         swDraw = swModel  # IDrawingDoc is the same COM object for .slddrw
