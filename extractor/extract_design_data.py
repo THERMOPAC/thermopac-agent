@@ -94,15 +94,12 @@ def _find_design_data_table(swDraw, logger) -> Optional[list]:
             except Exception:
                 continue
 
-            if t_type not in (SW_TABLE_ANNOTATION_GENERAL, SW_TABLE_ANNOTATION_BOM,
-                              SW_TABLE_ANNOTATION_REVISION):
-                continue
-
             try:
                 title = str(table_ann.Title or "").strip()
             except Exception:
                 title = ""
 
+            # Title match: accept any table type (Design Data can be GENERAL or custom)
             if "design data" in title.lower() or "design_data" in title.lower():
                 rows = _parse_table(table_ann, logger, label=f"{sheet_name}/{title}")
                 if rows:

@@ -139,43 +139,72 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         _check_cancel(cancel_event, "before OpenDoc6")
         logger.info(f"[Extractor] Opening: {temp_path}")
 
-        # Suppress missing-reference file prompts at the app level before any open attempt
-        try:
-            # swUserPreferenceIntegerValue_e.swFileMissingReferenceBehavior = 57
-            # Value 1 = don't prompt, use last saved search paths
-            swApp.SetUserPreferenceIntegerValue(57, 1)
-        except Exception:
-            pass  # preference may not exist in all SW versions; non-fatal
+        # Pre-configure SW to suppress missing-reference prompts at app level
+        for pref_id, pref_val in [
+            (57,  0),   # swFileMissingReferenceBehavior — 0=ignore, 1=use last paths
+            (176, 0),   # swReferencedDocumentsMissingBehavior — 0=don't open
+            (177, 0),   # related missing-ref preference
+        ]:
+            try:
+                swApp.SetUserPreferenceIntegerValue(pref_id, pref_val)
+            except Exception:
+                pass
 
-        # Pass 1: Silent | ReadOnly                         (no 3-D load)
-        # Pass 2: Silent | ReadOnly | ViewOnly (LDR mode)   (no 3-D load, drawing shell only)
-        # Pass 3: Silent | ReadOnly | LoadModel             (full load — last resort)
-        swModel = None
-        for pass_num, options in enumerate(
-            [SW_OPEN_READ_ONLY | SW_OPEN_SILENT,
-             SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_VIEW_ONLY,
-             SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_LOAD_MODEL], start=1
-        ):
-            errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-            warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-            swModel  = swApp.OpenDoc6(temp_path, SW_DOC_DRAWING, options, "", errors, warnings)
-            err_val  = errors.value
-            warn_val = warnings.value
-            logger.info(f"[Extractor] OpenDoc6 pass {pass_num}: "
+        swModel  = None
+        pass_num = 0
+        err_val  = 0
+        warn_val = 0
+
+        # ── Pass 0: OpenDoc7 with IDocumentSpecification (most control) ───────
+        # docSpec.Silent = True reliably suppresses ALL missing-ref dialogs,
+        # allowing the drawing to open in full mode even without referenced parts.
+        try:
+            docSpec = swApp.GetOpenDocSpec(temp_path)
+            docSpec.FileName     = temp_path
+            docSpec.DocumentType = SW_DOC_DRAWING
+            docSpec.ReadOnly     = True
+            docSpec.Silent       = True
+            swModel = swApp.OpenDoc7(docSpec)
+            err_val  = docSpec.Error
+            warn_val = docSpec.Warning
+            logger.info(f"[Extractor] OpenDoc7 pass 0: "
                         f"model={'OK' if swModel else 'None'} "
                         f"errors={_decode_sw_error(err_val)} "
                         f"warnings={_decode_sw_error(warn_val)}")
-            if swModel is not None:
-                break
+        except Exception as e:
+            logger.info(f"[Extractor] OpenDoc7 not available ({e}); falling back to OpenDoc6")
+            swModel = None
+
+        # ── Passes 1-3: OpenDoc6 fallbacks ────────────────────────────────────
+        if swModel is None:
+            for pass_num, options in enumerate(
+                [SW_OPEN_READ_ONLY | SW_OPEN_SILENT,
+                 SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_VIEW_ONLY,
+                 SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_LOAD_MODEL], start=1
+            ):
+                errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+                warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+                swModel  = swApp.OpenDoc6(
+                    temp_path, SW_DOC_DRAWING, options, "", errors, warnings)
+                err_val  = errors.value
+                warn_val = warnings.value
+                logger.info(f"[Extractor] OpenDoc6 pass {pass_num}: "
+                            f"model={'OK' if swModel else 'None'} "
+                            f"errors={_decode_sw_error(err_val)} "
+                            f"warnings={_decode_sw_error(warn_val)}")
+                if swModel is not None:
+                    break
 
         if swModel is None:
             raise RuntimeError(
                 f"OpenDoc6 returned None — cannot open {filename}. "
                 f"Errors={_decode_sw_error(err_val)} Warnings={_decode_sw_error(warn_val)}"
             )
-        # Pass 2 = SW_OPEN_VIEW_ONLY (LDR mode) — table API limited, DesignData soft-fails
+
+        # LDR mode = ViewOnly pass (pass 2) — table API limited, DesignData soft-fails
+        # pass_num 0 = OpenDoc7 full mode (best); 1 = OpenDoc6 full; 2 = LDR; 3 = LoadModel
         ldr_mode = (pass_num == 2)
-        logger.info(f"[Extractor] Document open OK (ldr_mode={ldr_mode})")
+        logger.info(f"[Extractor] Document open OK (pass={pass_num} ldr_mode={ldr_mode})")
 
         # SolidWorks DrawingDoc interface
         swDraw = swModel  # IDrawingDoc is the same COM object for .slddrw
