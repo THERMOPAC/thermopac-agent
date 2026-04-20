@@ -60,6 +60,7 @@ _SW_OPEN_ERRORS = {
     512:     "FileReadOnly",
     1024:    "ConversionRequired",
     4096:    "NeedToActivateDoc",
+    65536:   "ExternalRefsNotLoaded",   # ext refs unavailable; LDR opens OK, full-mode fails
     131072:  "GenRenderMat",
     262144:  "IdMismatch",
     524288:  "AddToCurrentDoc",
@@ -72,6 +73,38 @@ def _decode_sw_error(code: int) -> str:
         return "0 (none)"
     parts = [name for bit, name in _SW_OPEN_ERRORS.items() if code & bit]
     return f"{code} ({', '.join(parts) if parts else 'unknown'})"
+
+
+def _get_user_sw_search_paths(progid: str, logger) -> dict:
+    """
+    Read-only: query the user's already-running SolidWorks session for its
+    configured file-search folders, so the agent's dedicated instance can
+    inherit the same paths and find referenced parts/assemblies.
+
+    swSearchFolderTypes_e: 1=Parts, 2=Assemblies, 4=Drawings, 7=ReferencedDocuments
+    Safe — no changes to user session; pure read.
+    """
+    inherited: dict = {}
+    # Try versioned ProgID first, then base ProgID
+    for pid in [progid, "SldWorks.Application"]:
+        try:
+            existing_sw = win32com.client.GetActiveObject(pid)
+            for folder_type in [1, 2, 4, 7]:
+                try:
+                    paths = existing_sw.GetSearchFolders(folder_type)
+                    if paths:
+                        inherited[folder_type] = paths
+                except Exception:
+                    pass
+            if inherited:
+                logger.info(
+                    f"[Extractor] Inherited {len(inherited)} search-path type(s) "
+                    f"from running SW session ({pid})"
+                )
+            break
+        except Exception:
+            pass  # no SW session running — normal if user has SW closed
+    return inherited
 
 
 def _auto_dismiss_sw_dialogs(stop_event: threading.Event, logger) -> None:
@@ -188,6 +221,11 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         _check_cancel(cancel_event, "before SW launch")
         logger.info(f"[Extractor] Launching SolidWorks ({config.sw_progid})…")
         t_launch = time.monotonic()
+        # ── Inherit search paths from user's running SW session (read-only) ───
+        # Must happen BEFORE DispatchEx so we query the user's instance,
+        # then apply the same paths to our dedicated instance after launch.
+        inherited_paths = _get_user_sw_search_paths(config.sw_progid, logger)
+
         swApp = win32com.client.DispatchEx(config.sw_progid)
         swApp.Visible = config.sw_visible
         swApp.UserControlBackground = True
@@ -207,6 +245,26 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                 swApp.SetUserPreferenceIntegerValue(pref_id, pref_val)
             except Exception:
                 pass
+
+        # Apply inherited search paths from user's SW session
+        for folder_type, paths in inherited_paths.items():
+            try:
+                swApp.SetSearchFolders(folder_type, paths)
+            except Exception:
+                pass
+
+        # Also apply any manually configured model_search_path from config.ini
+        if getattr(config, "sw_model_search_path", ""):
+            raw = config.sw_model_search_path
+            folder_list = "\r\n".join(
+                p.strip() for p in raw.replace(";", "\n").splitlines() if p.strip()
+            )
+            for folder_type in [1, 2, 7]:
+                try:
+                    swApp.SetSearchFolders(folder_type, folder_list)
+                except Exception:
+                    pass
+            logger.info(f"[Extractor] SW model search path applied: {raw}")
 
         swModel  = None
         pass_num = 0

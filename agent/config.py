@@ -109,6 +109,8 @@ class AgentConfig:
 
         # ── SolidWorks ────────────────────────────────────────────────────────
         self.sw_visible = cfg.getboolean("solidworks", "visible", fallback=False)
+        self.sw_model_search_path = cfg.get(
+            "solidworks", "model_search_path", fallback="").strip()
 
         explicit_progid = cfg.get("solidworks", "solidworks_progid", fallback="").strip()
         if explicit_progid:
@@ -235,6 +237,12 @@ log_dir  = C:\\ThermopacAgent\\logs
 solidworks_version = {sw_ver_str}
 ; solidworks_progid =
 visible = false
+
+; Semicolon-separated list of root folders where SolidWorks should search for
+; referenced parts and assemblies when opening drawings.
+; Required for full-mode open when parts are NOT in the same folder as the drawing.
+; Example:  C:\\SolidWorks Projects;D:\\CAD Vault
+model_search_path =
 """
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
