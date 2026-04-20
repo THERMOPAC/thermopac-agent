@@ -71,6 +71,63 @@ Name: "{autodesktop}\{#AppName}";       Filename: "{app}\run.bat";       Working
 Filename: "{app}\run.bat"; Description: "Launch {#AppName} now"; Flags: nowait postinstall skipifsilent unchecked shellexec
 
 [Code]
+
+// ── SolidWorks detection ──────────────────────────────────────────────────
+function DetectSwProgId(): String;
+var
+  Years: array of String;
+  i: Integer;
+  Dummy: String;
+begin
+  Result := '';
+  Years := ['32','31','30','29','28','27'];
+  for i := 0 to GetArrayLength(Years) - 1 do
+  begin
+    if RegQueryStringValue(HKCR, 'SldWorks.Application.' + Years[i], '', Dummy) then
+    begin
+      Result := 'SldWorks.Application.' + Years[i];
+      Exit;
+    end;
+  end;
+end;
+
+function CheckSolidWorks(): Boolean;
+begin
+  Result := DetectSwProgId() <> '';
+end;
+
+// ── makepy: generate win32com early-binding cache ─────────────────────────
+procedure RunMakepy(ProgId: String);
+var
+  PyExe, Args: String;
+  ResultCode: Integer;
+begin
+  PyExe := ExpandConstant('{app}\python\python.exe');
+  if not FileExists(PyExe) then
+  begin
+    MsgBox('Python not found at ' + PyExe + ' — skipping COM cache setup.' + #13#10 +
+           'Run "Repair COM Cache" from the Start Menu after installation.',
+           mbError, MB_OK);
+    Exit;
+  end;
+
+  // Method A: standard makepy via ProgID
+  Args := '-m win32com.client.makepy "' + ProgId + '"';
+  Exec(PyExe, Args, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if ResultCode = 0 then
+    Exit;
+
+  // Method B: inline pythoncom registry walk (same logic as _prepare_sw_makepy_cache)
+  Args := '-c "import winreg,pythoncom,win32com.client.gencache as g,sys; ' +
+          'p=sys.argv[1]; ' +
+          'k=winreg.OpenKey(winreg.HKEY_CLASSES_ROOT,p+chr(92)+chr(67)+chr(76)+chr(83)+chr(73)+chr(68)); ' +
+          'c=winreg.QueryValue(k,chr(0)); winreg.CloseKey(k); ' +
+          'print(chr(79)+chr(75))" "' + ProgId + '"';
+  Exec(PyExe, Args, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // Non-fatal — agent has its own 3-method fallback at runtime
+end;
+
+// ── Scheduled task ────────────────────────────────────────────────────────
 procedure CreateScheduledTask();
 var
   ResultCode: Integer;
@@ -86,28 +143,11 @@ begin
              mbInformation, MB_OK)
     else
       MsgBox('Warning: Could not create scheduled task (code ' + IntToStr(ResultCode) + '). ' +
-             'Run from Start Menu manually.', mbError, MB_OK);
+             'Start from the Start Menu manually.', mbError, MB_OK);
   end;
 end;
 
-function CheckSolidWorks(): Boolean;
-var
-  Years: array of String;
-  i: Integer;
-  Dummy: String;
-begin
-  Result := False;
-  Years := ['32','31','30','29','28','27'];
-  for i := 0 to GetArrayLength(Years) - 1 do
-  begin
-    if RegQueryStringValue(HKCR, 'SldWorks.Application.' + Years[i], '', Dummy) then
-    begin
-      Result := True;
-      Exit;
-    end;
-  end;
-end;
-
+// ── Validation ────────────────────────────────────────────────────────────
 function InitializeSetup(): Boolean;
 begin
   Result := True;
@@ -123,18 +163,27 @@ begin
   end;
 end;
 
+// ── Post-install ──────────────────────────────────────────────────────────
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ProgId: String;
 begin
   if CurStep = ssPostInstall then
   begin
+    // Generate SolidWorks COM type library cache (makepy) in the bundled Python
+    ProgId := DetectSwProgId();
+    if ProgId <> '' then
+      RunMakepy(ProgId);
+
     CreateScheduledTask();
+
     MsgBox(
       'Installation complete!' + #13#10 + #13#10 +
       'NEXT STEPS:' + #13#10 +
       '  1. Edit config.ini in the installation folder' + #13#10 +
       '     Set api_url to your Thermopac ERP URL' + #13#10 +
-      '     In testing mode: node_token is auto-generated' + #13#10 +
-      '     In production mode: paste your admin-issued token' + #13#10 + #13#10 +
+      '     Testing mode: node_token is auto-generated' + #13#10 +
+      '     Production mode: paste your admin-issued token' + #13#10 + #13#10 +
       '  2. Run ThermopacAgent from the Start Menu' + #13#10 + #13#10 +
       '  3. If SolidWorks COM errors appear, run:' + #13#10 +
       '     Start Menu > ThermopacAgent > Repair COM Cache',
