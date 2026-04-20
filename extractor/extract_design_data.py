@@ -1,48 +1,39 @@
 """
-extract_design_data.py — ExtractDesignDataTable()  [MANDATORY in full mode]
+extract_design_data.py — ExtractDesignDataTable()  [MANDATORY]
 
 Reads the Design Data table from an open SolidWorks drawing.
-In full (non-LDR) mode this MUST succeed — if no table is found the caller
-marks the job as failed.
-In LDR (ViewOnly) mode the result is treated as a soft failure because table
-access is limited by the SolidWorks Large Design Review API.
+The drawing MUST be open in full mode (not LDR/ViewOnly).
+If no table is found, raises DesignDataNotFoundError (hard fail).
 
 Table detection logic (in order):
   1. Scan all sheets → all table annotations
-  2. Match table title containing "design data" (case-insensitive)
+  2. Match any table whose Title contains "design data" (case-insensitive)
+     — accepted for any table type (GENERAL, BOM, or custom)
   3. If no titled match → fall back to a General Table whose first column header
-     contains "parameter" or "description" (case-insensitive)
+     contains "parameter", "description", or "item" (case-insensitive)
   4. Parse rows as { parameter, value, unit } triples
 """
 
 from __future__ import annotations
-from typing import Optional
 from extractor._com_helper import sw_call, to_list
 
-SW_TABLE_ANNOTATION_GENERAL   = 11
-SW_TABLE_ANNOTATION_BOM       = 0
-SW_TABLE_ANNOTATION_REVISION  = 7
+SW_TABLE_ANNOTATION_GENERAL  = 11
+SW_TABLE_ANNOTATION_BOM      = 0
+SW_TABLE_ANNOTATION_REVISION = 7
 
 
 class DesignDataNotFoundError(Exception):
-    """Raised when no Design Data table is found in the drawing (hard fail, full mode only)."""
+    """Raised when no Design Data table is found in the drawing."""
 
 
-def ExtractDesignDataTable(swApp, swModel, swDraw, logger,
-                           ldr_mode: bool = False) -> dict:
+def ExtractDesignDataTable(swApp, swModel, swDraw, logger) -> dict:
     """
     Returns the 'design_data_table' section of the extraction JSON.
-    Raises DesignDataNotFoundError only when ldr_mode=False and no table found.
+    Always raises DesignDataNotFoundError if no table found (hard fail).
     """
     rows = _find_design_data_table(swDraw, logger)
 
     if not rows:
-        if ldr_mode:
-            logger.warning(
-                "[DesignData] Table not found — drawing opened in LDR (ViewOnly) mode; "
-                "table API is limited. Reporting found=False (soft fail)."
-            )
-            return {"found": False, "rows": [], "ldr_mode": True}
         logger.error("[DesignData] HARD FAIL — Design Data table not found in drawing")
         raise DesignDataNotFoundError(
             "Design Data table not found in drawing. "
@@ -51,13 +42,12 @@ def ExtractDesignDataTable(swApp, swModel, swDraw, logger,
 
     logger.info(f"[DesignData] Found {len(rows)} row(s)")
     return {
-        "found":    True,
-        "rows":     rows,
-        "ldr_mode": ldr_mode,
+        "found": True,
+        "rows":  rows,
     }
 
 
-def _find_design_data_table(swDraw, logger) -> Optional[list]:
+def _find_design_data_table(swDraw, logger) -> list | None:
     """Iterate all sheets and table annotations, return parsed rows or None."""
     try:
         sheet_names = to_list(sw_call(swDraw, "GetSheetNames"))
@@ -92,19 +82,20 @@ def _find_design_data_table(swDraw, logger) -> Optional[list]:
             try:
                 t_type = table_ann.Type
             except Exception:
-                continue
+                t_type = -1
 
             try:
                 title = str(table_ann.Title or "").strip()
             except Exception:
                 title = ""
 
-            # Title match: accept any table type (Design Data can be GENERAL or custom)
+            # Title match: accept any table type
             if "design data" in title.lower() or "design_data" in title.lower():
                 rows = _parse_table(table_ann, logger, label=f"{sheet_name}/{title}")
                 if rows:
                     return rows
 
+            # Fallback: first GENERAL table whose first column header looks like parameters
             if t_type == SW_TABLE_ANNOTATION_GENERAL and fallback_candidate is None:
                 try:
                     header = str(sw_call(table_ann, "Text", 0, 0) or "").lower()

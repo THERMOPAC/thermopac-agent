@@ -24,6 +24,13 @@ try:
 except ImportError:
     PYWIN32_AVAILABLE = False
 
+try:
+    import win32gui
+    import win32con
+    WIN32GUI_AVAILABLE = True
+except ImportError:
+    WIN32GUI_AVAILABLE = False
+
 from extractor.extract_properties    import ExtractProperties
 from extractor.extract_sheets        import ExtractSheets
 from extractor.extract_views         import ExtractViews
@@ -65,6 +72,57 @@ def _decode_sw_error(code: int) -> str:
         return "0 (none)"
     parts = [name for bit, name in _SW_OPEN_ERRORS.items() if code & bit]
     return f"{code} ({', '.join(parts) if parts else 'unknown'})"
+
+
+def _auto_dismiss_sw_dialogs(stop_event: threading.Event, logger) -> None:
+    """
+    Background thread — polls for SolidWorks 'referenced file not found' dialogs
+    and clicks the dismissal button (No / Cancel / Skip / Ignore / Don't Search).
+
+    This runs alongside an OpenDoc6 call that has NO Silent flag, so SW can show
+    its dialogs; we auto-dismiss them and the drawing opens in full mode with
+    degraded (empty) views but full table/annotation API access.
+    """
+    if not WIN32GUI_AVAILABLE:
+        return
+
+    # Buttons that dismiss the "can't find file" prompt without searching
+    _DISMISS = frozenset([
+        "no", "cancel", "skip", "ignore",
+        "don't search", "do not search", "suppress",
+    ])
+
+    def _click_dismiss(child_hwnd, _parent):
+        try:
+            txt = win32gui.GetWindowText(child_hwnd).strip().lower()
+            if txt in _DISMISS:
+                win32gui.PostMessage(child_hwnd, win32con.BM_CLICK, 0, 0)
+        except Exception:
+            pass
+
+    def _check_window(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        cls  = win32gui.GetClassName(hwnd)
+        if cls not in ('#32770', 'MsoCommandBar', 'SWFormsClass',
+                       'ThunderRT6Form', 'SldWorks'):
+            return
+        title = win32gui.GetWindowText(hwnd)
+        # Match any SW dialog that may be blocking on missing files
+        kws = ('solidworks', 'not found', 'missing', 'reference',
+               'cannot', 'locate', 'resolve', 'file')
+        if any(k in title.lower() for k in kws) or title == '':
+            try:
+                win32gui.EnumChildWindows(hwnd, _click_dismiss, None)
+            except Exception:
+                pass
+
+    while not stop_event.is_set():
+        try:
+            win32gui.EnumWindows(_check_window, None)
+        except Exception:
+            pass
+        time.sleep(0.08)
 
 
 def run_extraction(temp_path: str, config, cancel_event: threading.Event,
@@ -176,10 +234,13 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
             swModel = None
 
         # ── Passes 1-3: OpenDoc6 fallbacks ────────────────────────────────────
+        #   Pass 1: Silent | ReadOnly             (suppress all prompts, full mode attempt)
+        #   Pass D: ReadOnly only + dismiss thread (auto-click through missing-ref dialogs)
+        #   Pass 2: Silent | ReadOnly | ViewOnly  (LDR — degraded API, soft-fail on tables)
+        #   Pass 3: Silent | ReadOnly | LoadModel  (last resort)
         if swModel is None:
             for pass_num, options in enumerate(
                 [SW_OPEN_READ_ONLY | SW_OPEN_SILENT,
-                 SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_VIEW_ONLY,
                  SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_LOAD_MODEL], start=1
             ):
                 errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
@@ -194,17 +255,66 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                             f"warnings={_decode_sw_error(warn_val)}")
                 if swModel is not None:
                     break
+                # Insert dialog-dismiss pass between pass 1 and LoadModel
+                if pass_num == 1 and WIN32GUI_AVAILABLE:
+                    logger.info("[Extractor] OpenDoc6 pass D: ReadOnly + auto dialog-dismiss")
+                    stop_dismiss = threading.Event()
+                    dismisser    = threading.Thread(
+                        target=_auto_dismiss_sw_dialogs,
+                        args=(stop_dismiss, logger),
+                        daemon=True,
+                    )
+                    dismisser.start()
+                    try:
+                        d_errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+                        d_warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+                        d_model    = swApp.OpenDoc6(
+                            temp_path, SW_DOC_DRAWING, SW_OPEN_READ_ONLY, "", d_errors, d_warnings)
+                        d_err  = d_errors.value
+                        d_warn = d_warnings.value
+                        logger.info(f"[Extractor] OpenDoc6 pass D: "
+                                    f"model={'OK' if d_model else 'None'} "
+                                    f"errors={_decode_sw_error(d_err)} "
+                                    f"warnings={_decode_sw_error(d_warn)}")
+                        if d_model is not None:
+                            swModel  = d_model
+                            err_val  = d_err
+                            warn_val = d_warn
+                            pass_num = 'D'
+                            break
+                    except Exception as ex_d:
+                        logger.info(f"[Extractor] OpenDoc6 pass D exception: {ex_d}")
+                    finally:
+                        stop_dismiss.set()
+                        dismisser.join(timeout=2)
+
+        # ── ViewOnly (LDR) — diagnostics only, NOT a valid extraction path ──────
+        if swModel is None:
+            ldr_errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            ldr_warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            ldr_model    = swApp.OpenDoc6(
+                temp_path, SW_DOC_DRAWING,
+                SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_VIEW_ONLY, "",
+                ldr_errors, ldr_warnings)
+            logger.info(f"[Extractor] OpenDoc6 LDR/ViewOnly (diagnostics): "
+                        f"model={'OK' if ldr_model else 'None'} "
+                        f"errors={_decode_sw_error(ldr_errors.value)} "
+                        f"warnings={_decode_sw_error(ldr_warnings.value)}")
+            if ldr_model is not None:
+                try:
+                    swApp.CloseDoc(temp_path)
+                except Exception:
+                    pass
 
         if swModel is None:
             raise RuntimeError(
-                f"OpenDoc6 returned None — cannot open {filename}. "
-                f"Errors={_decode_sw_error(err_val)} Warnings={_decode_sw_error(warn_val)}"
+                f"Full-mode open failed — cannot extract DDS from {filename}. "
+                f"All passes (OpenDoc7, OpenDoc6-Silent, dialog-dismiss, LoadModel) returned None. "
+                f"LDR/ViewOnly is available but does not support table extraction. "
+                f"Last errors={_decode_sw_error(err_val)} warnings={_decode_sw_error(warn_val)}"
             )
 
-        # LDR mode = ViewOnly pass (pass 2) — table API limited, DesignData soft-fails
-        # pass_num 0 = OpenDoc7 full mode (best); 1 = OpenDoc6 full; 2 = LDR; 3 = LoadModel
-        ldr_mode = (pass_num == 2)
-        logger.info(f"[Extractor] Document open OK (pass={pass_num} ldr_mode={ldr_mode})")
+        logger.info(f"[Extractor] Document open OK in full mode (pass={pass_num})")
 
         # SolidWorks DrawingDoc interface
         swDraw = swModel  # IDrawingDoc is the same COM object for .slddrw
@@ -221,7 +331,7 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
             ("health",            lambda: ExtractHealth(swApp, swModel, swDraw, logger)),
             ("nozzles",           lambda: ExtractNozzles(swApp, swModel, swDraw, logger)),
             ("design_data_table", lambda: ExtractDesignDataTable(
-                swApp, swModel, swDraw, logger, ldr_mode=ldr_mode)),
+                swApp, swModel, swDraw, logger)),
         ]
 
         for key, fn in modules:
