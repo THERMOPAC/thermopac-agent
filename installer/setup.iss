@@ -11,12 +11,17 @@
 ;   - dist\python\          Python 3.11 embeddable (downloaded by build-installer.bat)
 
 #define AppName      "ThermopacAgent"
-#define AppVersion   "1.0.19"
+#define AppVersion   "1.0.20"
 #define AppPublisher "Thermopac"
 #define AppURL       "https://thermopac-communication-thermopacllp.replit.app"
 #define AppExeName   "run.bat"
-#define SourceDir    "..\dist\ThermopacAgent"
-#define PythonDir    "..\dist\python"
+; SourcePath is an InnoSetup built-in: the directory containing this .iss file
+; (always local-agent\installer\). Using it avoids CWD-relative path bugs
+; when ISCC is invoked from a different working directory (e.g. the repo root
+; or local-agent\ in GitHub Actions).
+#define AgentRoot    SourcePath + "\.."
+#define SourceDir    AgentRoot + "\dist\ThermopacAgent"
+#define PythonDir    AgentRoot + "\dist\python"
 
 [Setup]
 AppId={{7B4A1C2D-E3F5-4A6B-8C9D-0E1F2A3B4C5D}
@@ -27,7 +32,7 @@ AppPublisherURL={#AppURL}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 AllowNoIcons=yes
-OutputDir=..\installer_output
+OutputDir={#AgentRoot}\installer_output
 OutputBaseFilename=ThermopacAgent-Setup-v{#AppVersion}
 Compression=lzma2/ultra64
 SolidCompression=yes

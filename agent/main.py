@@ -28,6 +28,18 @@ import sys
 import time
 from datetime import datetime, timezone
 
+# ── UTF-8 console output ───────────────────────────────────────────────────
+# Windows defaults to the system code page (cp1252) for stdout/stderr.
+# The agent's log messages contain Unicode box-drawing and punctuation
+# (em-dash, ellipsis, arrows) that cp1252 cannot encode.
+# Reconfigure both streams to UTF-8 so output never crashes.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 if getattr(sys, "frozen", False):
     _base = os.path.dirname(sys.executable)
 else:

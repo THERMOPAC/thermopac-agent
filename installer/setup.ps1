@@ -27,7 +27,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ── Constants ────────────────────────────────────────────────────────────────
-$AGENT_VERSION   = "1.0.19"
+$AGENT_VERSION   = "1.0.20"
 $PY_VERSION      = "3.11.9"
 $PY_EMBED_ZIP    = "python-$PY_VERSION-embed-amd64.zip"
 $PY_EMBED_URL    = "https://www.python.org/ftp/python/$PY_VERSION/$PY_EMBED_ZIP"
@@ -465,6 +465,9 @@ Write-Step "Creating run scripts..."
 $run_bat = @"
 @echo off
 title ThermopacAgent v$AGENT_VERSION
+:: UTF-8 output — prevents UnicodeEncodeError on Windows cp1252 consoles
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
 echo.
 echo  ThermopacAgent — SolidWorks Extraction Agent
 echo  THERMOPAC ERP Integration
