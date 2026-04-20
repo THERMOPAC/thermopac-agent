@@ -241,14 +241,36 @@ def _prepare_sw_makepy_cache(progid: str, logger) -> None:
                          if f.lower() in ("sldworks.exe", "sldworks_worker.exe")]
             candidates = [os.path.join(sw_dir, f) for f in tlb_files + exe_files]
 
+            # Sort: sldworks* first, then other TLBs, then EXEs
+            def _c_sort_key(p):
+                b = os.path.basename(p).lower()
+                if b.startswith("sldworks") and b.endswith(".tlb"): return 0
+                if b.endswith(".tlb"): return 1
+                return 2
+            candidates.sort(key=_c_sort_key)
+
+            # Also scan one level of subdirectories (lang\english, api, etc.)
+            for sub in ("lang\\english", "lang", "api", "setup"):
+                sub_dir = os.path.join(sw_dir, sub)
+                if os.path.isdir(sub_dir):
+                    for f in os.listdir(sub_dir):
+                        if f.lower().endswith(".tlb"):
+                            p = os.path.join(sub_dir, f)
+                            if p not in candidates:
+                                candidates.append(p)
+
             for candidate in candidates:
                 if not os.path.isfile(candidate):
                     continue
                 try:
-                    logger.info(f"[Makepy-C] Trying: {candidate}")
                     tl = pythoncom.LoadTypeLib(candidate)
                     tla = tl.GetLibAttr()
                     clsid_c = str(tla[0]); major_c = tla[3]; minor_c = tla[4]
+                    # Only accept TLBs whose CLSID matches the expected SolidWorks TypeLib
+                    if tl_clsid and clsid_c.upper() != tl_clsid.upper():
+                        logger.debug(f"[Makepy-C] {os.path.basename(candidate)}: "
+                                     f"CLSID {clsid_c} ≠ {tl_clsid} — skipping")
+                        continue
                     win32com.client.gencache.EnsureModule(
                         clsid_c, 0, major_c, minor_c,
                         bForDemand=False, bBuildHidden=True)
@@ -307,6 +329,36 @@ def _prepare_sw_makepy_cache(progid: str, logger) -> None:
         "  To fix permanently run:  python -m win32com.client.makepy "
         f'"{progid}"'
     )
+
+
+def _seed_makepy_from_com_object(com_obj, logger) -> bool:
+    """
+    Method E (post-connect): Extract the TypeLib directly from the running COM
+    object via IDispatch.GetTypeInfo().  The COM server must expose its type
+    information through IDispatch — SolidWorks always does.
+
+    This is the most reliable approach: it bypasses all registry/file-system
+    lookup and asks the object itself for its type library.  If the pre-connect
+    methods (A-D) all failed, this runs after swApp = Dispatch() succeeds.
+
+    On success the gencache is seeded so subsequent CastTo(swModel, "IDrawingDoc")
+    calls work correctly.
+    """
+    try:
+        # IDispatch.GetTypeInfo(typeInfoNumber=0, lcid=0) → ITypeInfo
+        tinfo = com_obj._oleobj_.GetTypeInfo(0, 0)
+        # ITypeInfo.GetContainingTypeLib() → (ITypeLib, indexInTypeLib)
+        tlib, _ = tinfo.GetContainingTypeLib()
+        tla = tlib.GetLibAttr()
+        clsid_e = str(tla[0]); major_e = tla[3]; minor_e = tla[4]
+        logger.info(f"[Makepy-E] COM object TypeLib: {clsid_e}  v{major_e}.{minor_e}")
+        win32com.client.gencache.EnsureModule(
+            clsid_e, 0, major_e, minor_e, bForDemand=False, bBuildHidden=True)
+        logger.info("[Makepy-E] Post-connect cache seeded — CastTo now available")
+        return True
+    except Exception as e:
+        logger.warning(f"[Makepy-E] Post-connect TypeLib extraction failed: {e}")
+        return False
 
 
 def _get_user_sw_search_paths(progid: str, logger) -> dict:
@@ -478,13 +530,18 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         # If makepy cache is still missing, fall back to late-binding Dispatch —
         # it loses CastTo(IDrawingDoc) but OpenDoc6 + property bag still work.
         logger.info("[Extractor] Connecting to SolidWorks COM…")
+        _early_bound = False
         try:
             swApp = win32com.client.gencache.EnsureDispatch(config.sw_progid)
             logger.info("[Extractor] SolidWorks COM ready (early-bound)")
+            _early_bound = True
         except Exception as ed:
             logger.warning(f"[Extractor] EnsureDispatch failed ({ed}); trying late-binding Dispatch…")
             swApp = win32com.client.Dispatch(config.sw_progid)
-            logger.info("[Extractor] SolidWorks COM ready (late-bound — limited CastTo support)")
+            logger.info("[Extractor] SolidWorks COM ready (late-bound — attempting Method E…)")
+            # Method E: ask the running COM object for its own TypeLib — most reliable approach
+            if _seed_makepy_from_com_object(swApp, logger):
+                _early_bound = True
         swApp.Visible = config.sw_visible
         swApp.UserControlBackground = True
         logger.info(f"[Extractor] SolidWorks ready ({time.monotonic() - t_launch:.1f}s)")
