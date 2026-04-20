@@ -25,41 +25,77 @@ try:
 except ImportError:
     PYWIN32_AVAILABLE = False
 
-# IDrawingDoc IID extracted from sldworks.tlb at runtime — populated by Method C.
-# Used for raw QueryInterface so GetFirstView / sheet traversal work via pure IDispatch
-# without requiring makepy cache seeding or CastTo.
-_sw_drawing_doc_iid = None
+# COM TKIND constants
+_TKIND_INTERFACE = 3   # custom vtable interface
+_TKIND_DISPATCH  = 4   # IDispatch-based (dispinterface / dual)
+_TKIND_COCLASS   = 5   # coclass — has a CLSID, NOT an IID; skip for QI
+
+# IDrawingDoc info extracted from sldworks.tlb at runtime — populated by Method C.
+# _sw_drawing_doc_iid   : pywintypes.IID — used for raw QueryInterface
+# _sw_drawing_doc_tinfo : ITypeInfo      — used for DISPID lookup when QI fails
+_sw_drawing_doc_iid   = None
+_sw_drawing_doc_tinfo = None
 
 
 def _extract_sw_interface_iids(tl, logger) -> None:
     """
-    Scan every type in a loaded SolidWorks ITypeLib and cache the IID for
-    IDrawingDoc (and a few others) in module-level variables.
+    Scan every type in a loaded SolidWorks ITypeLib and cache the IID and
+    ITypeInfo for IDrawingDoc.
 
-    This is the ONLY thing we need from the TypeLib — no gen_py generation,
-    no EnsureModule, no gencache.  A raw QueryInterface with the IID is
-    sufficient to obtain the IDrawingDoc IDispatch vtable.
+    KEY: filter out TKIND_COCLASS (5) entries — their .iid is actually a CLSID
+    (which equals the TypeLib CLSID in some SW builds) and is WRONG for QI.
+    We only accept TKIND_INTERFACE (3) or TKIND_DISPATCH (4) entries.
+
+    Two outputs are stored globally:
+      _sw_drawing_doc_iid   → used for QueryInterface (gives IDrawingDoc vtable)
+      _sw_drawing_doc_tinfo → used for DISPID lookup when QI returns wrong object
     """
-    global _sw_drawing_doc_iid
-    want = {"IDrawingDoc"}
-    found = {}
+    global _sw_drawing_doc_iid, _sw_drawing_doc_tinfo
+    # Collect ALL candidates so we can choose the best typekind
+    candidates = []   # list of (typekind, iid, typeinfo)
     try:
         count = tl.GetTypeInfoCount()
         for i in range(count):
-            if not want - found.keys():
-                break
             try:
                 name = tl.GetDocumentation(i)[0]
-                if name in want:
-                    tattr = tl.GetTypeInfo(i).GetTypeAttr()
-                    found[name] = tattr.iid   # pywintypes.IID object
-            except Exception:
-                continue
-        if "IDrawingDoc" in found:
-            _sw_drawing_doc_iid = found["IDrawingDoc"]
-            logger.info(f"[Extractor] IDrawingDoc IID: {_sw_drawing_doc_iid}")
-        else:
-            logger.warning("[Extractor] IDrawingDoc not found in TypeLib scan")
+                if name != "IDrawingDoc":
+                    continue
+                tinfo = tl.GetTypeInfo(i)
+                tattr = tinfo.GetTypeAttr()
+                tk    = tattr.typekind
+                iid   = tattr.iid
+                logger.debug(
+                    f"[Extractor] IDrawingDoc candidate i={i} "
+                    f"typekind={tk} iid={iid}"
+                )
+                if tk in (_TKIND_INTERFACE, _TKIND_DISPATCH):
+                    candidates.append((tk, iid, tinfo))
+                else:
+                    logger.debug(
+                        f"[Extractor] Skipping IDrawingDoc typekind={tk} "
+                        f"(coclass/alias — GUID is CLSID, not IID)"
+                    )
+            except Exception as ce:
+                logger.debug(f"[Extractor] TypeLib scan i={i}: {ce}")
+
+        if not candidates:
+            logger.warning(
+                "[Extractor] IDrawingDoc interface not found in TypeLib scan "
+                "(no TKIND_INTERFACE/TKIND_DISPATCH entry)"
+            )
+            return
+
+        # Prefer TKIND_DISPATCH (4) — SW dual interfaces use this typekind.
+        # Fall back to TKIND_INTERFACE (3) if that's all we have.
+        dispatch = [c for c in candidates if c[0] == _TKIND_DISPATCH]
+        best_tk, best_iid, best_tinfo = (dispatch or candidates)[0]
+
+        _sw_drawing_doc_iid   = best_iid
+        _sw_drawing_doc_tinfo = best_tinfo
+        logger.info(
+            f"[Extractor] IDrawingDoc IID: {best_iid}  (typekind={best_tk})"
+        )
+
     except Exception as e:
         logger.warning(f"[Extractor] IID extraction failed: {e}")
 
