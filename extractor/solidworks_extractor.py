@@ -107,7 +107,7 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         t_launch = time.monotonic()
         swApp = win32com.client.DispatchEx(config.sw_progid)
         swApp.Visible = config.sw_visible
-        swApp.UserControlBackground(True)
+        swApp.UserControlBackground = True
         logger.info(f"[Extractor] SolidWorks ready ({time.monotonic() - t_launch:.1f}s)")
 
         # ── Open document (read-only, silent) ─────────────────────────────────
