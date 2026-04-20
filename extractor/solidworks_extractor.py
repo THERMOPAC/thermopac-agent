@@ -37,10 +37,11 @@ from extractor.extract_design_data   import ExtractDesignDataTable, DesignDataNo
 
 # SolidWorks constants  (swOpenDocOptions_e)
 SW_DOC_DRAWING           = 3
-SW_OPEN_SILENT           = 1     # swOpenDocOptions_Silent  — suppresses ALL dialogs (missing refs etc.)
+SW_OPEN_SILENT           = 1     # swOpenDocOptions_Silent      — suppresses ALL missing-ref dialogs
 SW_OPEN_READ_ONLY        = 2     # swOpenDocOptions_ReadOnly
-SW_OPEN_LOAD_MODEL       = 128   # swOpenDocOptions_LoadModel — NOT used (referenced parts absent in temp dir)
-# 64 = swOpenDocOptions_OverrideDefaultLoadedData  (was wrongly labelled SW_OPEN_SILENT previously)
+SW_OPEN_VIEW_ONLY        = 4     # swOpenDocOptions_ViewOnly    — Large Design Review, no 3-D load
+SW_OPEN_LOAD_MODEL       = 128   # swOpenDocOptions_LoadModel   — fallback only
+# NOTE: 64 = swOpenDocOptions_OverrideDefaultLoadedData (was wrongly used as SW_OPEN_SILENT before v1.0.4)
 
 # swOpenDocError_e decode map (for diagnostics)
 _SW_OPEN_ERRORS = {
@@ -138,11 +139,21 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         _check_cancel(cancel_event, "before OpenDoc6")
         logger.info(f"[Extractor] Opening: {temp_path}")
 
-        # Pass 1: no SW_OPEN_LOAD_MODEL — drawing only, referenced parts not in temp dir
-        # Pass 2: fallback with SW_OPEN_LOAD_MODEL in case SW requires it for this file
+        # Suppress missing-reference file prompts at the app level before any open attempt
+        try:
+            # swUserPreferenceIntegerValue_e.swFileMissingReferenceBehavior = 57
+            # Value 1 = don't prompt, use last saved search paths
+            swApp.SetUserPreferenceIntegerValue(57, 1)
+        except Exception:
+            pass  # preference may not exist in all SW versions; non-fatal
+
+        # Pass 1: Silent | ReadOnly                         (no 3-D load)
+        # Pass 2: Silent | ReadOnly | ViewOnly (LDR mode)   (no 3-D load, drawing shell only)
+        # Pass 3: Silent | ReadOnly | LoadModel             (full load — last resort)
         swModel = None
         for pass_num, options in enumerate(
             [SW_OPEN_READ_ONLY | SW_OPEN_SILENT,
+             SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_VIEW_ONLY,
              SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_LOAD_MODEL], start=1
         ):
             errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
