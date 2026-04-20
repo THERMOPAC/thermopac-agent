@@ -35,11 +35,12 @@ from extractor.extract_health        import ExtractHealth
 from extractor.extract_nozzles       import ExtractNozzles
 from extractor.extract_design_data   import ExtractDesignDataTable, DesignDataNotFoundError
 
-# SolidWorks constants
+# SolidWorks constants  (swOpenDocOptions_e)
 SW_DOC_DRAWING           = 3
-SW_OPEN_READ_ONLY        = 2
-SW_OPEN_SILENT           = 64
-SW_OPEN_LOAD_MODEL       = 128   # NOT used — referenced parts are absent in temp dir
+SW_OPEN_SILENT           = 1     # swOpenDocOptions_Silent  — suppresses ALL dialogs (missing refs etc.)
+SW_OPEN_READ_ONLY        = 2     # swOpenDocOptions_ReadOnly
+SW_OPEN_LOAD_MODEL       = 128   # swOpenDocOptions_LoadModel — NOT used (referenced parts absent in temp dir)
+# 64 = swOpenDocOptions_OverrideDefaultLoadedData  (was wrongly labelled SW_OPEN_SILENT previously)
 
 # swOpenDocError_e decode map (for diagnostics)
 _SW_OPEN_ERRORS = {
