@@ -1,9 +1,9 @@
 @echo off
 setlocal
-title ThermopacAgent v1.0.31 - Updater
+title ThermopacAgent v1.0.32 - Updater
 
 echo ============================================================
-echo  ThermopacAgent v1.0.31 - Auto Updater
+echo  ThermopacAgent v1.0.32 - Auto Updater
 echo  Updates an existing installation in-place.
 echo ============================================================
 echo.
@@ -51,7 +51,7 @@ if errorlevel 1 ( echo   WARNING: run.bat copy had errors )
 
 echo.
 echo ============================================================
-echo  Update complete!  v1.0.31 is now installed.
+echo  Update complete!  v1.0.32 is now installed.
 echo ============================================================
 echo.
 
