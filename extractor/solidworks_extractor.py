@@ -25,6 +25,44 @@ try:
 except ImportError:
     PYWIN32_AVAILABLE = False
 
+# IDrawingDoc IID extracted from sldworks.tlb at runtime — populated by Method C.
+# Used for raw QueryInterface so GetFirstView / sheet traversal work via pure IDispatch
+# without requiring makepy cache seeding or CastTo.
+_sw_drawing_doc_iid = None
+
+
+def _extract_sw_interface_iids(tl, logger) -> None:
+    """
+    Scan every type in a loaded SolidWorks ITypeLib and cache the IID for
+    IDrawingDoc (and a few others) in module-level variables.
+
+    This is the ONLY thing we need from the TypeLib — no gen_py generation,
+    no EnsureModule, no gencache.  A raw QueryInterface with the IID is
+    sufficient to obtain the IDrawingDoc IDispatch vtable.
+    """
+    global _sw_drawing_doc_iid
+    want = {"IDrawingDoc"}
+    found = {}
+    try:
+        count = tl.GetTypeInfoCount()
+        for i in range(count):
+            if not want - found.keys():
+                break
+            try:
+                name = tl.GetDocumentation(i)[0]
+                if name in want:
+                    tattr = tl.GetTypeInfo(i).GetTypeAttr()
+                    found[name] = tattr.iid   # pywintypes.IID object
+            except Exception:
+                continue
+        if "IDrawingDoc" in found:
+            _sw_drawing_doc_iid = found["IDrawingDoc"]
+            logger.info(f"[Extractor] IDrawingDoc IID: {_sw_drawing_doc_iid}")
+        else:
+            logger.warning("[Extractor] IDrawingDoc not found in TypeLib scan")
+    except Exception as e:
+        logger.warning(f"[Extractor] IID extraction failed: {e}")
+
 try:
     import win32gui
     import win32con
@@ -273,12 +311,18 @@ def _prepare_sw_makepy_cache(progid: str, logger) -> None:
                         logger.debug(f"[Makepy-C] {os.path.basename(candidate)}: "
                                      f"CLSID {clsid_c} ≠ {tl_clsid} — skipping")
                         continue
-                    # Pass the ITypeLib object (not the CLSID string) so EnsureModule
-                    # uses the already-loaded library without going back to the registry.
-                    win32com.client.gencache.EnsureModule(
-                        tl, 0, major_c, minor_c,
-                        bForDemand=False, bBuildHidden=True)
-                    logger.info(f"[Makepy-C] Success — cache seeded from {candidate}")
+                    # Extract IDrawingDoc IID first — this is the critical output.
+                    # IID is used for raw QueryInterface later; no gencache needed.
+                    _extract_sw_interface_iids(tl, logger)
+                    # Also attempt EnsureModule (bonus early-binding; non-fatal if it fails)
+                    try:
+                        win32com.client.gencache.EnsureModule(
+                            tl, 0, major_c, minor_c,
+                            bForDemand=False, bBuildHidden=True)
+                        logger.info(f"[Makepy-C] Cache seeded from {candidate}")
+                    except Exception as em:
+                        logger.debug(f"[Makepy-C] EnsureModule skipped: {em}")
+                    logger.info(f"[Makepy-C] TLB loaded — IID extracted from {candidate}")
                     return
                 except Exception as ce:
                     logger.debug(f"[Makepy-C] {candidate} skipped: {ce}")
@@ -722,23 +766,43 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         except Exception as e:
             logger.warning(f"[Extractor] GetType() skipped: {e} — assuming Drawing and continuing")
 
-        # ── QueryInterface to IDrawingDoc ─────────────────────────────────────
-        # Early-binding (EnsureDispatch): CastTo does a proper COM QueryInterface.
-        # Late-binding (Dispatch): CastTo needs type-lib info it doesn't have, so
-        # we fall back to using swModel directly — SolidWorks exposes all IDrawingDoc
-        # methods through the IDispatch vtable, so GetCurrentSheet / GetFirstView /
-        # GetNextView / ActivateSheet all work without an explicit QI.
+        # ── Obtain IDrawingDoc interface ───────────────────────────────────────
+        # IDrawingDoc methods (GetFirstView, GetNextView, ActivateSheet, …) live
+        # on a SEPARATE IDispatch vtable from IModelDoc2.  Calling them on swModel
+        # fails with "Member not found" because IModelDoc2's IDispatch doesn't
+        # include them.
+        #
+        # Strategy (no makepy / gencache required):
+        #   1. Raw QueryInterface with the IDrawingDoc IID extracted from sldworks.tlb
+        #      by Method C.  This gives us IDrawingDoc's OWN IDispatch vtable, which
+        #      does expose GetFirstView.  win32com.client.Dispatch() wraps it.
+        #   2. Fallback: use swModel directly (only IModelDoc2 methods available).
         swDraw = None
-        try:
-            swDraw = win32com.client.CastTo(swModel, "IDrawingDoc")
-            logger.info("[Extractor] CastTo IDrawingDoc: OK (early-bound)")
-        except Exception as e:
-            logger.warning(f"[Extractor] CastTo failed ({e}); using model object directly (late-bound)")
+        if _sw_drawing_doc_iid is not None:
+            try:
+                # QI swModel for the IDrawingDoc interface — same COM object, different vtable
+                qi_ptr = swModel._oleobj_.QueryInterface(_sw_drawing_doc_iid)
+                # Wrap the raw IDrawingDoc pointer as a late-binding Dispatch object.
+                # win32com.client.Dispatch() will QI for IDispatch automatically.
+                swDraw = win32com.client.Dispatch(qi_ptr)
+                logger.info("[Extractor] IDrawingDoc via QueryInterface: OK")
+            except Exception as e:
+                logger.warning(f"[Extractor] IDrawingDoc QI failed ({e}); falling back to swModel")
+                swDraw = None
+
+        if swDraw is None:
             swDraw = swModel
+            logger.warning(
+                "[Extractor] No IDrawingDoc IID available — using swModel directly. "
+                "IDrawingDoc methods (GetFirstView etc.) may not be accessible."
+            )
 
         # Confirm GetFirstView is accessible on whatever interface we have
         try:
-            _test_view = swDraw.GetFirstView()
+            gfv_fn = getattr(swDraw, "GetFirstView", None)
+            if gfv_fn is None or not callable(gfv_fn):
+                raise AttributeError("GetFirstView not found on COM object")
+            _test_view = gfv_fn()
             logger.info(
                 f"[Extractor] GetFirstView OK "
                 f"({'view returned' if _test_view else 'None — sheet may not be active yet'})"
