@@ -184,8 +184,10 @@ def _prepare_sw_makepy_cache(progid: str, logger) -> None:
         tla = tl.GetLibAttr()
         clsid_b = str(tla[0]); major_b = tla[3]; minor_b = tla[4]
         logger.info(f"[Makepy-B] TypeLib attrs: {clsid_b}  v{major_b}.{minor_b}")
+        # Pass the ITypeLib object (not the CLSID string) so EnsureModule
+        # uses the already-loaded library without going back to the registry.
         win32com.client.gencache.EnsureModule(
-            clsid_b, 0, major_b, minor_b, bForDemand=False, bBuildHidden=True)
+            tl, 0, major_b, minor_b, bForDemand=False, bBuildHidden=True)
         logger.info("[Makepy-B] Success — cache seeded via sldworks.exe LocalServer32")
         return
 
@@ -271,8 +273,10 @@ def _prepare_sw_makepy_cache(progid: str, logger) -> None:
                         logger.debug(f"[Makepy-C] {os.path.basename(candidate)}: "
                                      f"CLSID {clsid_c} ≠ {tl_clsid} — skipping")
                         continue
+                    # Pass the ITypeLib object (not the CLSID string) so EnsureModule
+                    # uses the already-loaded library without going back to the registry.
                     win32com.client.gencache.EnsureModule(
-                        clsid_c, 0, major_c, minor_c,
+                        tl, 0, major_c, minor_c,
                         bForDemand=False, bBuildHidden=True)
                     logger.info(f"[Makepy-C] Success — cache seeded from {candidate}")
                     return
@@ -352,8 +356,9 @@ def _seed_makepy_from_com_object(com_obj, logger) -> bool:
         tla = tlib.GetLibAttr()
         clsid_e = str(tla[0]); major_e = tla[3]; minor_e = tla[4]
         logger.info(f"[Makepy-E] COM object TypeLib: {clsid_e}  v{major_e}.{minor_e}")
+        # Pass the ITypeLib object directly — bypasses registry lookup
         win32com.client.gencache.EnsureModule(
-            clsid_e, 0, major_e, minor_e, bForDemand=False, bBuildHidden=True)
+            tlib, 0, major_e, minor_e, bForDemand=False, bBuildHidden=True)
         logger.info("[Makepy-E] Post-connect cache seeded — CastTo now available")
         return True
     except Exception as e:
@@ -538,12 +543,18 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         except Exception as ed:
             logger.warning(f"[Extractor] EnsureDispatch failed ({ed}); trying late-binding Dispatch…")
             swApp = win32com.client.Dispatch(config.sw_progid)
-            logger.info("[Extractor] SolidWorks COM ready (late-bound — attempting Method E…)")
-            # Method E: ask the running COM object for its own TypeLib — most reliable approach
-            if _seed_makepy_from_com_object(swApp, logger):
-                _early_bound = True
-        swApp.Visible = config.sw_visible
+            logger.info("[Extractor] SolidWorks COM ready (late-bound)")
+        # Force full COM initialisation so IDrawingDoc interface is fully loaded.
+        # Visible=True + UserControl=True + a brief delay ensures SolidWorks has
+        # finished its own COM registration before we attempt OpenDoc.
+        swApp.Visible = True
+        try:
+            swApp.UserControl = True
+        except Exception:
+            pass
         swApp.UserControlBackground = True
+        logger.info("[Extractor] Waiting 2.5 s for SolidWorks COM to fully initialise…")
+        time.sleep(2.5)
         logger.info(f"[Extractor] SolidWorks ready ({time.monotonic() - t_launch:.1f}s)")
 
         # ── Open document (read-only, silent) ─────────────────────────────────
@@ -618,10 +629,13 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         if swModel is None:
             _close_zombie("OpenDoc7")
 
-        # ── Passes 1-3: OpenDoc6 fallbacks ────────────────────────────────────
-        #   Pass 1: Silent | ReadOnly             (suppress all prompts, full mode attempt)
-        #   Pass D: ReadOnly only + dismiss thread (auto-click through missing-ref dialogs)
-        #   Pass 3: Silent | ReadOnly | LoadModel  (last resort)
+        # ── Passes 1-2: OpenDoc6 with Silent only (no LDR/ViewOnly) ─────────
+        #   Pass 1: Silent | ReadOnly
+        #   Pass D: ReadOnly + auto-dismiss thread (catches missing-ref dialogs)
+        #   Pass 2: Silent | ReadOnly | LoadModel  (last resort full-mode)
+        # LDR / ViewOnly (swOpenDocOptions_ViewOnly) is intentionally excluded —
+        # it opens drawings without full COM interface support, making
+        # IDrawingDoc.GetFirstView() inaccessible.
         if swModel is None:
             for pass_num, options in enumerate(
                 [SW_OPEN_READ_ONLY | SW_OPEN_SILENT,
@@ -675,41 +689,22 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                         stop_dismiss.set()
                         dismisser.join(timeout=2)
 
-        # ── ViewOnly (LDR) — fallback extraction path for DDS ────────────────
-        # Drawing tables (General Tables / Design Data) are stored in the
-        # drawing sheet itself, not in referenced 3-D part files.  LDR mode
-        # fully loads drawing-sheet annotations and tables; only 3-D geometry
-        # is skipped.  If all full-mode passes fail (e.g. ExternalRefsNotLoaded)
-        # we still attempt DDS extraction in LDR mode before giving up.
-        ldr_mode = False
-        if swModel is None:
-            ldr_errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-            ldr_warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-            ldr_model    = swApp.OpenDoc6(
-                temp_path, SW_DOC_DRAWING,
-                SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_VIEW_ONLY, "",
-                ldr_errors, ldr_warnings)
-            logger.info(f"[Extractor] OpenDoc6 LDR/ViewOnly: "
-                        f"model={'OK' if ldr_model else 'None'} "
-                        f"errors={_decode_sw_error(ldr_errors.value)} "
-                        f"warnings={_decode_sw_error(ldr_warnings.value)}")
-            if ldr_model is not None:
-                swModel  = ldr_model
-                err_val  = ldr_errors.value
-                warn_val = ldr_warnings.value
-                ldr_mode = True
-                logger.info("[Extractor] Proceeding in LDR mode — will attempt DDS table extraction")
-
         if swModel is None:
             raise RuntimeError(
                 f"All open passes failed for {filename}. "
                 f"Last errors={_decode_sw_error(err_val)} warnings={_decode_sw_error(warn_val)}"
             )
 
-        if ldr_mode:
-            logger.info("[Extractor] Document open OK in LDR/ViewOnly mode")
-        else:
-            logger.info(f"[Extractor] Document open OK in full mode (pass={pass_num})")
+        logger.info(f"[Extractor] Document open OK in full mode (pass={pass_num})")
+
+        # ── Method E: seed makepy cache from the opened document object ───────
+        # Now that a fully-loaded COM object (swModel) is available, ask it for
+        # its own TypeLib via IDispatch.GetTypeInfo().  This is the most reliable
+        # path — the document object itself knows its interface definitions.
+        # On success EnsureDispatch becomes available for CastTo(IDrawingDoc).
+        if not _early_bound:
+            if _seed_makepy_from_com_object(swModel, logger):
+                _early_bound = True
 
         # ── Verify document type ───────────────────────────────────────────────
         # swDocumentTypes_e: 1=Part, 2=Assembly, 3=Drawing
