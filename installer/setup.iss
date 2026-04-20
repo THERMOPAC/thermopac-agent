@@ -11,7 +11,7 @@
 ;   - dist\python\          Python 3.11 embeddable (downloaded by build-installer.bat)
 
 #define AppName      "ThermopacAgent"
-#define AppVersion   "1.0.28"
+#define AppVersion   "1.0.29"
 #define AppPublisher "Thermopac"
 #define AppURL       "https://thermopac-communication-thermopacllp.replit.app"
 #define AppExeName   "run.bat"
