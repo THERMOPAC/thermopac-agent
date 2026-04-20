@@ -1,9 +1,9 @@
 @echo off
 setlocal
-title ThermopacAgent v1.0.30 - Updater
+title ThermopacAgent v1.0.31 - Updater
 
 echo ============================================================
-echo  ThermopacAgent v1.0.30 - Auto Updater
+echo  ThermopacAgent v1.0.31 - Auto Updater
 echo  Updates an existing installation in-place.
 echo ============================================================
 echo.
@@ -29,9 +29,10 @@ echo.
 echo Stopping any running agent processes...
 schtasks /End /TN "ThermopacAgent" >nul 2>&1
 taskkill /F /FI "WINDOWTITLE eq ThermopacAgent*" /T >nul 2>&1
+taskkill /F /FI "IMAGENAME eq ThermopacAgent.exe" /T >nul 2>&1
 taskkill /F /FI "IMAGENAME eq python.exe" /T >nul 2>&1
 taskkill /F /FI "IMAGENAME eq pythonw.exe" /T >nul 2>&1
-timeout /t 2 /nobreak >nul
+timeout /t 3 /nobreak >nul
 echo Done.
 echo.
 
@@ -50,7 +51,7 @@ if errorlevel 1 ( echo   WARNING: run.bat copy had errors )
 
 echo.
 echo ============================================================
-echo  Update complete!  v1.0.30 is now installed.
+echo  Update complete!  v1.0.31 is now installed.
 echo ============================================================
 echo.
 
