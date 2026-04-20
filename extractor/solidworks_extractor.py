@@ -113,15 +113,19 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         # ── Open document (read-only, silent) ─────────────────────────────────
         _check_cancel(cancel_event, "before OpenDoc6")
         options = SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_LOAD_MODEL
-        errors   = 0
-        warnings = 0
+        # OpenDoc6 Errors/Warnings are ByRef Long — must use VARIANT(VT_BYREF|VT_I4)
+        # for late-bound COM (DispatchEx); plain Python int causes Type mismatch (0x80020005)
+        errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         logger.info(f"[Extractor] Opening: {temp_path}")
         # OpenDoc6(FileName, Type, Options, Configuration, Errors, Warnings)
         swModel = swApp.OpenDoc6(temp_path, SW_DOC_DRAWING, options, "", errors, warnings)
+        err_val  = errors.value
+        warn_val = warnings.value
         if swModel is None:
             raise RuntimeError(f"OpenDoc6 returned None — cannot open {filename}. "
-                               f"Errors={errors} Warnings={warnings}")
-        logger.info(f"[Extractor] Document open (errors={errors} warnings={warnings})")
+                               f"Errors={err_val} Warnings={warn_val}")
+        logger.info(f"[Extractor] Document open (errors={err_val} warnings={warn_val})")
 
         # SolidWorks DrawingDoc interface
         swDraw = swModel  # IDrawingDoc is the same COM object for .slddrw
