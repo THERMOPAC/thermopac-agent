@@ -152,48 +152,58 @@ def _prepare_sw_makepy_cache(progid: str, logger) -> None:
     except Exception as e:
         logger.warning(f"[Makepy-A] Failed: {e}")
 
-    # ── Method B: registry TLB file path → LoadTypeLib → EnsureModule ────
+    # ── Method B: LocalServer32 → LoadTypeLib on sldworks.exe directly ───
+    # SolidWorks 2019+ embeds its TypeLib as a resource inside sldworks.exe.
+    # There is NO standalone .tlb file and the TypeLib registry entry often has
+    # no file-path sub-key.  The CLSID\{app_clsid}\LocalServer32 key always
+    # points to the real sldworks.exe — LoadTypeLib handles resource-embedded
+    # TLBs transparently.
     try:
         app_clsid, tl_clsid = _resolve_tl_clsid(progid)
-        versions = _enum_typelib_versions(tl_clsid)
-        if not versions:
-            raise ValueError(f"No numeric TypeLib version sub-keys for {tl_clsid}")
-        major, minor, ver_str = versions[-1]
 
-        found_path = None
-        for arch in ("win64", "win32", ""):
-            sub = f"TypeLib\\{tl_clsid}\\{ver_str}\\0"
-            key_path = f"{sub}\\{arch}" if arch else sub
+        # Get the actual sldworks.exe path from LocalServer32
+        exe_path = None
+        for key_path in (
+            f"CLSID\\{app_clsid}\\LocalServer32",
+            f"WOW6432Node\\CLSID\\{app_clsid}\\LocalServer32",
+        ):
             try:
                 with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, key_path) as k:
-                    raw = winreg.QueryValue(k, "").strip('"').split(",")[0].strip()
+                    raw = winreg.QueryValue(k, "").strip('"').split('"')[0].strip()
+                    raw = raw.split(" /")[0].strip()   # strip any CLI flags
                 if raw and os.path.isfile(raw):
-                    found_path = raw; break
+                    exe_path = raw; break
             except OSError:
                 continue
 
-        if not found_path:
-            raise ValueError(f"No usable TLB file path in registry for {tl_clsid}")
+        if not exe_path:
+            raise ValueError(f"LocalServer32 for {app_clsid} not found or file missing")
 
-        logger.info(f"[Makepy-B] TLB file: {found_path}")
-        pythoncom.LoadTypeLib(found_path)
+        logger.info(f"[Makepy-B] Loading TypeLib from: {exe_path}")
+        tl = pythoncom.LoadTypeLib(exe_path)
+        tla = tl.GetLibAttr()
+        clsid_b = str(tla[0]); major_b = tla[3]; minor_b = tla[4]
+        logger.info(f"[Makepy-B] TypeLib attrs: {clsid_b}  v{major_b}.{minor_b}")
         win32com.client.gencache.EnsureModule(
-            tl_clsid, 0, major, minor, bForDemand=False, bBuildHidden=True)
-        logger.info("[Makepy-B] Success — early-binding cache seeded via TLB file")
+            clsid_b, 0, major_b, minor_b, bForDemand=False, bBuildHidden=True)
+        logger.info("[Makepy-B] Success — cache seeded via sldworks.exe LocalServer32")
         return
 
     except Exception as e:
         logger.warning(f"[Makepy-B] Failed: {e}")
 
-    # ── Method C: SolidWorks install dir → scan for .tlb or sldworks.exe ─
+    # ── Method C: year-based registry scan + LocalServer32 fallback ───────
     try:
         sw_dirs = []
-        # Map Application.N to year (SW 2019 = .27, 2020 = .28, …)
+
+        # Primary: look up SolidWorks install dir by year
         for year in range(2024, 2016, -1):
             for hive in (winreg.HKEY_LOCAL_MACHINE,):
                 for base in (
                     f"SOFTWARE\\SolidWorks\\SolidWorks {year}\\Setup",
                     f"SOFTWARE\\WOW6432Node\\SolidWorks\\SolidWorks {year}\\Setup",
+                    f"SOFTWARE\\SolidWorks\\SOLIDWORKS {year}\\Setup",
+                    f"SOFTWARE\\WOW6432Node\\SolidWorks\\SOLIDWORKS {year}\\Setup",
                 ):
                     try:
                         with winreg.OpenKey(hive, base) as k:
@@ -203,14 +213,32 @@ def _prepare_sw_makepy_cache(progid: str, logger) -> None:
                     except OSError:
                         pass
 
+        # Fallback: derive install dir from CLSID LocalServer32 (always reliable)
+        try:
+            app_clsid2, _ = _resolve_tl_clsid(progid)
+            for kp in (f"CLSID\\{app_clsid2}\\LocalServer32",
+                       f"WOW6432Node\\CLSID\\{app_clsid2}\\LocalServer32"):
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, kp) as k:
+                        raw = winreg.QueryValue(k, "").strip('"').split('"')[0].strip()
+                        raw = raw.split(" /")[0].strip()
+                    d = os.path.dirname(raw)
+                    if d and os.path.isdir(d) and d not in sw_dirs:
+                        sw_dirs.append(d)
+                        logger.info(f"[Makepy-C] SW dir via LocalServer32: {d}")
+                    break
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
         if not sw_dirs:
-            raise ValueError("SolidWorks install dir not found in registry")
+            raise ValueError("SolidWorks install dir not found via any registry path")
 
         for sw_dir in sw_dirs:
-            # Prefer explicit .tlb files; fall back to resource-embedded in exe
-            tlb_files  = [f for f in os.listdir(sw_dir) if f.lower().endswith(".tlb")]
-            exe_files  = [f for f in os.listdir(sw_dir)
-                          if f.lower() in ("sldworks.exe", "sldworks_worker.exe")]
+            tlb_files = [f for f in os.listdir(sw_dir) if f.lower().endswith(".tlb")]
+            exe_files = [f for f in os.listdir(sw_dir)
+                         if f.lower() in ("sldworks.exe", "sldworks_worker.exe")]
             candidates = [os.path.join(sw_dir, f) for f in tlb_files + exe_files]
 
             for candidate in candidates:
