@@ -2,7 +2,9 @@
 extract_design_data.py — ExtractDesignDataTable()  [MANDATORY]
 
 Reads the Design Data table from an open SolidWorks drawing.
-The drawing MUST be open in full mode (not LDR/ViewOnly).
+Works in both full-mode and LDR/ViewOnly mode.  Drawing General Tables
+are stored in the drawing sheet, not in referenced 3-D part files, so
+LDR mode has full read access to them.
 If no table is found, raises DesignDataNotFoundError (hard fail).
 
 Table detection logic (in order):

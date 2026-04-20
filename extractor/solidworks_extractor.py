@@ -346,7 +346,13 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                         stop_dismiss.set()
                         dismisser.join(timeout=2)
 
-        # ── ViewOnly (LDR) — diagnostics only, NOT a valid extraction path ──────
+        # ── ViewOnly (LDR) — fallback extraction path for DDS ────────────────
+        # Drawing tables (General Tables / Design Data) are stored in the
+        # drawing sheet itself, not in referenced 3-D part files.  LDR mode
+        # fully loads drawing-sheet annotations and tables; only 3-D geometry
+        # is skipped.  If all full-mode passes fail (e.g. ExternalRefsNotLoaded)
+        # we still attempt DDS extraction in LDR mode before giving up.
+        ldr_mode = False
         if swModel is None:
             ldr_errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
             ldr_warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
@@ -354,25 +360,27 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                 temp_path, SW_DOC_DRAWING,
                 SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_VIEW_ONLY, "",
                 ldr_errors, ldr_warnings)
-            logger.info(f"[Extractor] OpenDoc6 LDR/ViewOnly (diagnostics): "
+            logger.info(f"[Extractor] OpenDoc6 LDR/ViewOnly: "
                         f"model={'OK' if ldr_model else 'None'} "
                         f"errors={_decode_sw_error(ldr_errors.value)} "
                         f"warnings={_decode_sw_error(ldr_warnings.value)}")
             if ldr_model is not None:
-                try:
-                    swApp.CloseDoc(temp_path)
-                except Exception:
-                    pass
+                swModel  = ldr_model
+                err_val  = ldr_errors.value
+                warn_val = ldr_warnings.value
+                ldr_mode = True
+                logger.info("[Extractor] Proceeding in LDR mode — will attempt DDS table extraction")
 
         if swModel is None:
             raise RuntimeError(
-                f"Full-mode open failed — cannot extract DDS from {filename}. "
-                f"All passes (OpenDoc7, OpenDoc6-Silent, dialog-dismiss, LoadModel) returned None. "
-                f"LDR/ViewOnly is available but does not support table extraction. "
+                f"All open passes failed for {filename}. "
                 f"Last errors={_decode_sw_error(err_val)} warnings={_decode_sw_error(warn_val)}"
             )
 
-        logger.info(f"[Extractor] Document open OK in full mode (pass={pass_num})")
+        if ldr_mode:
+            logger.info("[Extractor] Document open OK in LDR/ViewOnly mode")
+        else:
+            logger.info(f"[Extractor] Document open OK in full mode (pass={pass_num})")
 
         # SolidWorks DrawingDoc interface
         swDraw = swModel  # IDrawingDoc is the same COM object for .slddrw
