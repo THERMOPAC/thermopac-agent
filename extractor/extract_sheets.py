@@ -4,6 +4,7 @@ Reads sheet names, scale, paper size, and view count from the drawing.
 """
 
 from __future__ import annotations
+from extractor._com_helper import sw_call, to_list
 
 SW_PAPER_SIZES = {
     0:  "A0", 1:  "A1", 2:  "A2",  3:  "A3",  4:  "A4",
@@ -15,40 +16,37 @@ SW_PAPER_SIZES = {
 def ExtractSheets(swApp, swModel, swDraw, logger) -> list:
     result = []
     try:
-        sheet_names = swDraw.GetSheetNames()
+        sheet_names = to_list(sw_call(swDraw, "GetSheetNames"))
         if not sheet_names:
             logger.warning("[Sheets] No sheets found")
             return result
-
-        if not hasattr(sheet_names, "__iter__"):
-            sheet_names = [sheet_names]
 
         for name in sheet_names:
             entry = {"sheet_name": str(name), "scale": "", "paper_size": "", "view_count": 0}
             try:
                 swDraw.ActivateSheet(name)
-                swSheet = swDraw.GetCurrentSheet()
+                swSheet = sw_call(swDraw, "GetCurrentSheet")
+                if swSheet is None:
+                    result.append(entry)
+                    continue
 
-                # Scale: GetScale2(True) returns scale as ratio (e.g. 0.1 = 1:10)
                 try:
-                    scale_ratio = swSheet.GetScale2(True)
+                    scale_ratio = sw_call(swSheet, "GetScale2", True)
                     if scale_ratio and scale_ratio > 0:
                         denom = round(1.0 / scale_ratio)
                         entry["scale"] = f"1:{denom}"
                 except Exception:
                     pass
 
-                # Paper size
                 try:
-                    size_idx = swSheet.GetSize()
+                    size_idx = sw_call(swSheet, "GetSize")
                     entry["paper_size"] = SW_PAPER_SIZES.get(size_idx, f"size_{size_idx}")
                 except Exception:
                     pass
 
-                # View count
                 try:
-                    views = swSheet.GetViews()
-                    entry["view_count"] = len(views) if views else 0
+                    views = to_list(sw_call(swSheet, "GetViews"))
+                    entry["view_count"] = len(views)
                 except Exception:
                     pass
 

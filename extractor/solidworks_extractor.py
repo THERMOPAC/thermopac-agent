@@ -173,7 +173,9 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                 f"OpenDoc6 returned None — cannot open {filename}. "
                 f"Errors={_decode_sw_error(err_val)} Warnings={_decode_sw_error(warn_val)}"
             )
-        logger.info(f"[Extractor] Document open OK")
+        # Pass 2 = SW_OPEN_VIEW_ONLY (LDR mode) — table API limited, DesignData soft-fails
+        ldr_mode = (pass_num == 2)
+        logger.info(f"[Extractor] Document open OK (ldr_mode={ldr_mode})")
 
         # SolidWorks DrawingDoc interface
         swDraw = swModel  # IDrawingDoc is the same COM object for .slddrw
@@ -189,7 +191,8 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
             ("references",        lambda: ExtractReferences(swApp, swModel, swDraw, logger)),
             ("health",            lambda: ExtractHealth(swApp, swModel, swDraw, logger)),
             ("nozzles",           lambda: ExtractNozzles(swApp, swModel, swDraw, logger)),
-            ("design_data_table", lambda: ExtractDesignDataTable(swApp, swModel, swDraw, logger)),
+            ("design_data_table", lambda: ExtractDesignDataTable(
+                swApp, swModel, swDraw, logger, ldr_mode=ldr_mode)),
         ]
 
         for key, fn in modules:

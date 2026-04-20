@@ -4,38 +4,31 @@ Reads view names, types, scale, and model references from all sheets.
 """
 
 from __future__ import annotations
+from extractor._com_helper import sw_call, to_list
 
 SW_VIEW_TYPES = {
-    1: "base",
-    2: "projected",
-    3: "section",
-    4: "detail",
-    5: "auxiliary",
-    6: "standard_3view",
-    7: "relative",
-    8: "predefined",
-    9: "empty",
+    1: "base", 2: "projected", 3: "section", 4: "detail",
+    5: "auxiliary", 6: "standard_3view", 7: "relative",
+    8: "predefined", 9: "empty",
 }
 
 
 def ExtractViews(swApp, swModel, swDraw, logger) -> list:
     result = []
     try:
-        sheet_names = swDraw.GetSheetNames()
+        sheet_names = to_list(sw_call(swDraw, "GetSheetNames"))
         if not sheet_names:
             return result
-        if not hasattr(sheet_names, "__iter__"):
-            sheet_names = [sheet_names]
 
         for sheet_name in sheet_names:
             try:
                 swDraw.ActivateSheet(sheet_name)
-                swSheet = swDraw.GetCurrentSheet()
-                views = swSheet.GetViews()
+                swSheet = sw_call(swDraw, "GetCurrentSheet")
+                if swSheet is None:
+                    continue
+                views = to_list(sw_call(swSheet, "GetViews"))
                 if not views:
                     continue
-                if not hasattr(views, "__iter__"):
-                    views = [views]
 
                 for view in views:
                     entry = {
@@ -46,7 +39,7 @@ def ExtractViews(swApp, swModel, swDraw, logger) -> list:
                         "model_reference": "",
                     }
                     try:
-                        entry["view_name"] = str(view.GetName2() or "")
+                        entry["view_name"] = str(sw_call(view, "GetName2") or "")
                     except Exception:
                         pass
                     try:
@@ -62,7 +55,7 @@ def ExtractViews(swApp, swModel, swDraw, logger) -> list:
                     except Exception:
                         pass
                     try:
-                        ref_model = view.GetReferencedModelName()
+                        ref_model = sw_call(view, "GetReferencedModelName")
                         if ref_model:
                             import os
                             entry["model_reference"] = os.path.basename(ref_model)

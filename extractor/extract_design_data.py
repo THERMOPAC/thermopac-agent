@@ -1,9 +1,11 @@
 """
-extract_design_data.py — ExtractDesignDataTable()  [MANDATORY]
+extract_design_data.py — ExtractDesignDataTable()  [MANDATORY in full mode]
 
 Reads the Design Data table from an open SolidWorks drawing.
-This module MUST succeed. If the table is not found or is empty, the caller
-must mark the job as failed — do NOT submit partial JSON without this section.
+In full (non-LDR) mode this MUST succeed — if no table is found the caller
+marks the job as failed.
+In LDR (ViewOnly) mode the result is treated as a soft failure because table
+access is limited by the SolidWorks Large Design Review API.
 
 Table detection logic (in order):
   1. Scan all sheets → all table annotations
@@ -15,25 +17,32 @@ Table detection logic (in order):
 
 from __future__ import annotations
 from typing import Optional
+from extractor._com_helper import sw_call, to_list
 
-# SolidWorks table type constants
 SW_TABLE_ANNOTATION_GENERAL   = 11
 SW_TABLE_ANNOTATION_BOM       = 0
 SW_TABLE_ANNOTATION_REVISION  = 7
 
 
 class DesignDataNotFoundError(Exception):
-    """Raised when no Design Data table is found in the drawing."""
+    """Raised when no Design Data table is found in the drawing (hard fail, full mode only)."""
 
 
-def ExtractDesignDataTable(swApp, swModel, swDraw, logger) -> dict:
+def ExtractDesignDataTable(swApp, swModel, swDraw, logger,
+                           ldr_mode: bool = False) -> dict:
     """
     Returns the 'design_data_table' section of the extraction JSON.
-    Raises DesignDataNotFoundError if table is absent or empty.
+    Raises DesignDataNotFoundError only when ldr_mode=False and no table found.
     """
     rows = _find_design_data_table(swDraw, logger)
 
     if not rows:
+        if ldr_mode:
+            logger.warning(
+                "[DesignData] Table not found — drawing opened in LDR (ViewOnly) mode; "
+                "table API is limited. Reporting found=False (soft fail)."
+            )
+            return {"found": False, "rows": [], "ldr_mode": True}
         logger.error("[DesignData] HARD FAIL — Design Data table not found in drawing")
         raise DesignDataNotFoundError(
             "Design Data table not found in drawing. "
@@ -42,15 +51,16 @@ def ExtractDesignDataTable(swApp, swModel, swDraw, logger) -> dict:
 
     logger.info(f"[DesignData] Found {len(rows)} row(s)")
     return {
-        "found": True,
-        "rows":  rows,
+        "found":    True,
+        "rows":     rows,
+        "ldr_mode": ldr_mode,
     }
 
 
 def _find_design_data_table(swDraw, logger) -> Optional[list]:
     """Iterate all sheets and table annotations, return parsed rows or None."""
     try:
-        sheet_names = swDraw.GetSheetNames()
+        sheet_names = to_list(sw_call(swDraw, "GetSheetNames"))
         if not sheet_names:
             return None
     except Exception as e:
@@ -62,22 +72,21 @@ def _find_design_data_table(swDraw, logger) -> Optional[list]:
     for sheet_name in sheet_names:
         try:
             swDraw.ActivateSheet(sheet_name)
-            swSheet = swDraw.GetCurrentSheet()
+            swSheet = sw_call(swDraw, "GetCurrentSheet")
+            if swSheet is None:
+                continue
         except Exception as e:
             logger.debug(f"[DesignData] cannot activate sheet '{sheet_name}': {e}")
             continue
 
         try:
-            table_anns = swSheet.GetTableAnnotations()
+            table_anns = to_list(sw_call(swSheet, "GetTableAnnotations"))
         except Exception as e:
             logger.debug(f"[DesignData] cannot get table annotations on '{sheet_name}': {e}")
             continue
 
         if not table_anns:
             continue
-
-        if not hasattr(table_anns, "__iter__"):
-            table_anns = [table_anns]
 
         for table_ann in table_anns:
             try:
@@ -99,17 +108,14 @@ def _find_design_data_table(swDraw, logger) -> Optional[list]:
                 if rows:
                     return rows
 
-            # Collect fallback: General Table where first column header looks like
-            # parameter / description list
             if t_type == SW_TABLE_ANNOTATION_GENERAL and fallback_candidate is None:
                 try:
-                    header = str(table_ann.Text(0, 0) or "").lower()
+                    header = str(sw_call(table_ann, "Text", 0, 0) or "").lower()
                     if any(k in header for k in ("parameter", "description", "item")):
                         fallback_candidate = (table_ann, sheet_name, title)
                 except Exception:
                     pass
 
-    # No titled match — try fallback
     if fallback_candidate:
         table_ann, sheet_name, title = fallback_candidate
         logger.warning(f"[DesignData] No 'Design Data' title found; using fallback "
@@ -122,10 +128,6 @@ def _find_design_data_table(swDraw, logger) -> Optional[list]:
 
 
 def _parse_table(table_ann, logger, label: str) -> list:
-    """
-    Parse a SolidWorks table annotation into rows of { parameter, value, unit }.
-    Skips empty rows and header rows.
-    """
     rows = []
     try:
         row_count = table_ann.RowCount
@@ -141,28 +143,23 @@ def _parse_table(table_ann, logger, label: str) -> list:
             cells = []
             for c in range(col_count):
                 try:
-                    cells.append(str(table_ann.Text(r, c) or "").strip())
+                    cells.append(str(sw_call(table_ann, "Text", r, c) or "").strip())
                 except Exception:
                     cells.append("")
 
             if not any(cells):
-                continue  # skip blank rows
+                continue
 
             param = cells[0] if len(cells) > 0 else ""
             value = cells[1] if len(cells) > 1 else ""
             unit  = cells[2] if len(cells) > 2 else ""
 
-            # Skip header row heuristic
             if r == 0 and param.lower() in ("parameter", "description", "item", "no", "#"):
                 continue
             if not param:
                 continue
 
-            rows.append({
-                "parameter": param,
-                "value":     value,
-                "unit":      unit,
-            })
+            rows.append({"parameter": param, "value": value, "unit": unit})
         except Exception as e:
             logger.debug(f"[DesignData] row {r} parse error: {e}")
             continue

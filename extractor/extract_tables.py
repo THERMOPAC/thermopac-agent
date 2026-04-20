@@ -5,6 +5,7 @@ Soft failure.
 """
 
 from __future__ import annotations
+from extractor._com_helper import sw_call, to_list
 
 SW_TABLE_BOM       = 0
 SW_TABLE_GENERAL   = 11
@@ -20,21 +21,19 @@ def ExtractTables(swApp, swModel, swDraw, logger) -> dict:
         "general_tolerance_table_found": False,
     }
     try:
-        sheet_names = swDraw.GetSheetNames()
+        sheet_names = to_list(sw_call(swDraw, "GetSheetNames"))
         if not sheet_names:
             return result
-        if not hasattr(sheet_names, "__iter__"):
-            sheet_names = [sheet_names]
 
         for sheet_name in sheet_names:
             try:
                 swDraw.ActivateSheet(sheet_name)
-                swSheet = swDraw.GetCurrentSheet()
-                table_anns = swSheet.GetTableAnnotations()
+                swSheet = sw_call(swDraw, "GetCurrentSheet")
+                if swSheet is None:
+                    continue
+                table_anns = to_list(sw_call(swSheet, "GetTableAnnotations"))
                 if not table_anns:
                     continue
-                if not hasattr(table_anns, "__iter__"):
-                    table_anns = [table_anns]
 
                 for ta in table_anns:
                     try:
@@ -54,18 +53,19 @@ def ExtractTables(swApp, swModel, swDraw, logger) -> dict:
                         try:
                             row_count = ta.RowCount
                             col_count = ta.ColumnCount
-                            for r in range(1, row_count):  # skip header row 0
+                            for r in range(1, row_count):
                                 row_data = {}
                                 labels = ["rev", "date", "description", "by"]
                                 for c in range(min(col_count, 4)):
                                     try:
-                                        row_data[labels[c]] = str(ta.Text(r, c) or "").strip()
+                                        row_data[labels[c]] = str(
+                                            sw_call(ta, "Text", r, c) or "").strip()
                                     except Exception:
                                         row_data[labels[c]] = ""
                                 if any(row_data.values()):
                                     result["revision_rows"].append(row_data)
                         except Exception as e:
-                            logger.debug(f"[Tables] revision table parse error: {e}")
+                            logger.debug(f"[Tables] revision parse error: {e}")
 
                     elif t_type == SW_TABLE_GENERAL:
                         try:

@@ -5,11 +5,12 @@ Soft failure.
 """
 
 from __future__ import annotations
+from extractor._com_helper import sw_call, to_list
 
 SW_ANN_NOTE         = 5
 SW_ANN_WELD_SYMBOL  = 28
 SW_ANN_SURFACE      = 22
-SW_ANN_GTOL         = 11  # geometric tolerance
+SW_ANN_GTOL         = 11
 
 
 def ExtractAnnotations(swApp, swModel, swDraw, logger) -> dict:
@@ -21,38 +22,34 @@ def ExtractAnnotations(swApp, swModel, swDraw, logger) -> dict:
         "notes_sample":         [],
     }
     try:
-        sheet_names = swDraw.GetSheetNames()
+        sheet_names = to_list(sw_call(swDraw, "GetSheetNames"))
         if not sheet_names:
             return result
-        if not hasattr(sheet_names, "__iter__"):
-            sheet_names = [sheet_names]
 
         for sheet_name in sheet_names:
             try:
                 swDraw.ActivateSheet(sheet_name)
-                swSheet = swDraw.GetCurrentSheet()
-                ann_views = swSheet.GetViews()
+                swSheet = sw_call(swDraw, "GetCurrentSheet")
+                if swSheet is None:
+                    continue
+                ann_views = to_list(sw_call(swSheet, "GetViews"))
                 if not ann_views:
                     continue
-                if not hasattr(ann_views, "__iter__"):
-                    ann_views = [ann_views]
 
                 for view in ann_views:
                     try:
-                        anns = view.GetAnnotations()
+                        anns = to_list(sw_call(view, "GetAnnotations"))
                         if not anns:
                             continue
-                        if not hasattr(anns, "__iter__"):
-                            anns = [anns]
 
                         for ann in anns:
                             try:
-                                t = ann.GetType()
+                                t = sw_call(ann, "GetType")
                                 if t == SW_ANN_NOTE:
                                     result["notes_count"] += 1
                                     if len(result["notes_sample"]) < 30:
                                         try:
-                                            text = str(ann.GetText() or "").strip()
+                                            text = str(sw_call(ann, "GetText") or "").strip()
                                             if text:
                                                 result["notes_sample"].append(text)
                                         except Exception:
