@@ -54,57 +54,104 @@ def _find_design_data_table(swDraw, logger) -> list | None:
     try:
         sheet_names = to_list(sw_call(swDraw, "GetSheetNames"))
         if not sheet_names:
+            logger.error("[DesignData] GetSheetNames returned empty — no sheets found")
             return None
+        logger.info(f"[DesignData] Sheets found: {sheet_names}")
     except Exception as e:
         logger.error(f"[DesignData] cannot get sheet names: {e}")
         return None
 
     fallback_candidate = None
+    all_tables_seen = []  # for diagnostics
 
     for sheet_name in sheet_names:
         try:
             swDraw.ActivateSheet(sheet_name)
             swSheet = sw_call(swDraw, "GetCurrentSheet")
             if swSheet is None:
+                logger.warning(f"[DesignData] GetCurrentSheet=None after activating '{sheet_name}'")
                 continue
         except Exception as e:
-            logger.debug(f"[DesignData] cannot activate sheet '{sheet_name}': {e}")
+            logger.warning(f"[DesignData] cannot activate sheet '{sheet_name}': {e}")
             continue
 
+        # ── Primary path: ISheet::GetTableAnnotations ──────────────────────
         try:
             table_anns = to_list(sw_call(swSheet, "GetTableAnnotations"))
         except Exception as e:
-            logger.debug(f"[DesignData] cannot get table annotations on '{sheet_name}': {e}")
-            continue
+            logger.warning(f"[DesignData] GetTableAnnotations failed on '{sheet_name}': {e}")
+            table_anns = []
 
-        if not table_anns:
-            continue
+        logger.info(f"[DesignData] Sheet '{sheet_name}': {len(table_anns) if table_anns else 0} table(s) via GetTableAnnotations")
 
-        for table_ann in table_anns:
+        for table_ann in (table_anns or []):
             try:
                 t_type = table_ann.Type
             except Exception:
                 t_type = -1
-
             try:
                 title = str(table_ann.Title or "").strip()
             except Exception:
                 title = ""
+            try:
+                rows_count = table_ann.RowCount
+                cols_count = table_ann.ColumnCount
+            except Exception:
+                rows_count = cols_count = "?"
 
-            # Title match: accept any table type
+            logger.info(f"[DesignData]   table type={t_type} title='{title}' size={rows_count}x{cols_count}")
+            all_tables_seen.append((sheet_name, t_type, title))
+
             if "design data" in title.lower() or "design_data" in title.lower():
+                logger.info(f"[DesignData] MATCH on title '{title}' — parsing")
                 rows = _parse_table(table_ann, logger, label=f"{sheet_name}/{title}")
                 if rows:
                     return rows
 
-            # Fallback: first GENERAL table whose first column header looks like parameters
             if t_type == SW_TABLE_ANNOTATION_GENERAL and fallback_candidate is None:
                 try:
                     header = str(sw_call(table_ann, "Text", 0, 0) or "").lower()
+                    logger.info(f"[DesignData]   general table first-cell='{header}'")
                     if any(k in header for k in ("parameter", "description", "item")):
                         fallback_candidate = (table_ann, sheet_name, title)
                 except Exception:
                     pass
+
+        # ── Secondary path: GetFirstAnnotation2 sweep ──────────────────────
+        # Catches tables that ISheet::GetTableAnnotations may miss
+        try:
+            ann = swSheet.GetFirstAnnotation2(6)  # swTableAnnotation = 6
+        except Exception:
+            ann = None
+
+        ann_count = 0
+        while ann is not None and ann_count < 200:
+            ann_count += 1
+            try:
+                tbl = ann.GetSpecificAnnotation()
+                t_type = tbl.Type if tbl else -1
+                try:
+                    title = str(tbl.Title or "").strip() if tbl else ""
+                except Exception:
+                    title = ""
+                logger.info(f"[DesignData]   [sweep] ann#{ann_count} type={t_type} title='{title}'")
+                if tbl and ("design data" in title.lower() or "design_data" in title.lower()):
+                    logger.info(f"[DesignData] MATCH via sweep on title '{title}'")
+                    rows = _parse_table(tbl, logger, label=f"{sheet_name}/{title}")
+                    if rows:
+                        return rows
+            except Exception as e:
+                logger.debug(f"[DesignData] sweep ann#{ann_count} error: {e}")
+            try:
+                ann = ann.GetNext5(6)
+            except Exception:
+                break
+
+        if ann_count > 0:
+            logger.info(f"[DesignData] Sheet '{sheet_name}': {ann_count} annotation(s) via sweep")
+
+    if not all_tables_seen:
+        logger.error("[DesignData] No table annotations found on ANY sheet via GetTableAnnotations")
 
     if fallback_candidate:
         table_ann, sheet_name, title = fallback_candidate
