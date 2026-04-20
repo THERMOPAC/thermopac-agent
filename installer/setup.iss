@@ -52,8 +52,13 @@ Name: "startupschedule";  Description: "Start agent automatically at &Windows lo
 [Files]
 ; Agent source files
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Bundled Python runtime (includes makepy cache generated at build time)
-Source: "{#PythonDir}\*"; DestDir: "{app}\python"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Bundled Python runtime — optional.  If dist\python\ was not created at build time
+; (e.g. a CI run without the embeddable download step) ISCC skips this entry safely.
+; When present the installer is fully self-contained; when absent setup.ps1 downloads
+; Python from python.org at install time.
+Source: "{#PythonDir}\*"; DestDir: "{app}\python"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+; PowerShell bootstrap — always bundled so Python can be fetched if not pre-bundled
+Source: "{#SourcePath}setup.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Dirs]
 Name: "{commonappdata}\ThermopacAgent\temp";   Permissions: everyone-full
@@ -167,13 +172,39 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ProgId: String;
+  PyExe, Ps1: String;
+  ResultCode: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
-    // Generate SolidWorks COM type library cache (makepy) in the bundled Python
-    ProgId := DetectSwProgId();
-    if ProgId <> '' then
-      RunMakepy(ProgId);
+    PyExe := ExpandConstant('{app}\python\python.exe');
+    Ps1   := ExpandConstant('{app}\setup.ps1');
+
+    // If Python was NOT bundled by the installer, run setup.ps1 to fetch it
+    if not FileExists(PyExe) then
+    begin
+      if FileExists(Ps1) then
+      begin
+        MsgBox(
+          'Python was not bundled in this installer.' + #13#10 +
+          'setup.ps1 will now download Python 3.11 from python.org.' + #13#10 + #13#10 +
+          'A PowerShell window will open — leave it running until complete.',
+          mbInformation, MB_OK);
+        Exec('powershell.exe',
+          '-ExecutionPolicy Bypass -File "' + Ps1 + '"',
+          ExpandConstant('{app}'), SW_SHOW, ewWaitUntilTerminated, ResultCode);
+      end else
+        MsgBox(
+          'Python not found and setup.ps1 is missing.' + #13#10 +
+          'Run "Repair COM Cache" from the Start Menu after placing setup.ps1 in ' +
+          ExpandConstant('{app}') + '.', mbError, MB_OK);
+    end else
+    begin
+      // Python IS bundled — run makepy for the detected SolidWorks version
+      ProgId := DetectSwProgId();
+      if ProgId <> '' then
+        RunMakepy(ProgId);
+    end;
 
     CreateScheduledTask();
 
