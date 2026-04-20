@@ -50,15 +50,21 @@ Name: "desktopicon";      Description: "Create a &desktop shortcut";            
 Name: "startupschedule";  Description: "Start agent automatically at &Windows login"; GroupDescription: "Auto-start:";       Flags: unchecked
 
 [Files]
-; Agent source files
+; Agent EXE + supporting files (PyInstaller output)
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Bundled Python runtime — optional.  If dist\python\ was not created at build time
 ; (e.g. a CI run without the embeddable download step) ISCC skips this entry safely.
 ; When present the installer is fully self-contained; when absent setup.ps1 downloads
 ; Python from python.org at install time.
 Source: "{#PythonDir}\*"; DestDir: "{app}\python"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+; Launch scripts (not part of PyInstaller output — must be listed explicitly)
+Source: "{#SourcePath}run.bat";           DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}run-service.bat";   DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}makepy-repair.bat"; DestDir: "{app}"; Flags: ignoreversion
 ; PowerShell bootstrap — always bundled so Python can be fetched if not pre-bundled
 Source: "{#SourcePath}setup.ps1"; DestDir: "{app}"; Flags: ignoreversion
+; Default config — users edit this after installation
+Source: "{#AgentRoot}\config.ini"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
 
 [Dirs]
 Name: "{commonappdata}\ThermopacAgent\temp";   Permissions: everyone-full
