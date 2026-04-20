@@ -274,6 +274,16 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         # ── Pass 0: OpenDoc7 with IDocumentSpecification (most control) ───────
         # docSpec.Silent = True reliably suppresses ALL missing-ref dialogs,
         # allowing the drawing to open in full mode even without referenced parts.
+        def _close_zombie(label: str):
+            """CloseDoc after a failed open attempt to clear SW's internal open-state registry.
+            Without this, SW returns AlreadyOpen (65536) for every subsequent attempt on the
+            same path, even when OpenDoc returned None (zombie registration)."""
+            try:
+                swApp.CloseDoc(temp_path)
+                logger.info(f"[Extractor] CloseDoc cleanup after failed {label}")
+            except Exception:
+                pass  # expected if nothing was actually registered
+
         try:
             docSpec = swApp.GetOpenDocSpec(temp_path)
             docSpec.FileName     = temp_path
@@ -290,11 +300,12 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         except Exception as e:
             logger.info(f"[Extractor] OpenDoc7 not available ({e}); falling back to OpenDoc6")
             swModel = None
+        if swModel is None:
+            _close_zombie("OpenDoc7")
 
         # ── Passes 1-3: OpenDoc6 fallbacks ────────────────────────────────────
         #   Pass 1: Silent | ReadOnly             (suppress all prompts, full mode attempt)
         #   Pass D: ReadOnly only + dismiss thread (auto-click through missing-ref dialogs)
-        #   Pass 2: Silent | ReadOnly | ViewOnly  (LDR — degraded API, soft-fail on tables)
         #   Pass 3: Silent | ReadOnly | LoadModel  (last resort)
         if swModel is None:
             for pass_num, options in enumerate(
@@ -313,6 +324,7 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                             f"warnings={_decode_sw_error(warn_val)}")
                 if swModel is not None:
                     break
+                _close_zombie(f"pass {pass_num}")
                 # Insert dialog-dismiss pass between pass 1 and LoadModel
                 if pass_num == 1 and WIN32GUI_AVAILABLE:
                     logger.info("[Extractor] OpenDoc6 pass D: ReadOnly + auto dialog-dismiss")
@@ -340,8 +352,10 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                             warn_val = d_warn
                             pass_num = 'D'
                             break
+                        _close_zombie("pass D")
                     except Exception as ex_d:
                         logger.info(f"[Extractor] OpenDoc6 pass D exception: {ex_d}")
+                        _close_zombie("pass D (exception)")
                     finally:
                         stop_dismiss.set()
                         dismisser.join(timeout=2)
