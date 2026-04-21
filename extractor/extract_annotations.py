@@ -69,6 +69,29 @@ def ExtractAnnotations(swApp, swModel, swDraw, logger) -> dict:
     except Exception as e:
         logger.error(f"[Annotations] unexpected error: {e}")
 
+    def consume_annotation(ann):
+        try:
+            t = sw_call(ann, "GetType")
+            if t == SW_ANN_NOTE:
+                result["notes_count"] += 1
+                if len(result["notes_sample"]) < 30:
+                    for method in ("GetText", "Text"):
+                        try:
+                            text = str(sw_call(ann, method) or "").strip()
+                            if text:
+                                result["notes_sample"].append(text)
+                                break
+                        except Exception:
+                            pass
+            elif t == SW_ANN_WELD_SYMBOL:
+                result["weld_symbols_count"] += 1
+            elif t == SW_ANN_SURFACE:
+                result["surface_finish_count"] += 1
+            elif t == SW_ANN_GTOL:
+                result["gd_t_count"] += 1
+        except Exception:
+            pass
+
     if (
         result["notes_count"] == 0
         and result["weld_symbols_count"] == 0
@@ -77,24 +100,36 @@ def ExtractAnnotations(swApp, swModel, swDraw, logger) -> dict:
     ):
         try:
             for _, view in iter_drawing_views(swDraw):
-                anns = to_list(sw_call(view, "GetAnnotations"))
-                for ann in anns:
+                anns = []
+                for method in ("GetAnnotations", "Annotations"):
                     try:
-                        t = sw_call(ann, "GetType")
-                        if t == SW_ANN_NOTE:
-                            result["notes_count"] += 1
-                            if len(result["notes_sample"]) < 30:
-                                text = str(sw_call(ann, "GetText") or "").strip()
-                                if text:
-                                    result["notes_sample"].append(text)
-                        elif t == SW_ANN_WELD_SYMBOL:
-                            result["weld_symbols_count"] += 1
-                        elif t == SW_ANN_SURFACE:
-                            result["surface_finish_count"] += 1
-                        elif t == SW_ANN_GTOL:
-                            result["gd_t_count"] += 1
+                        anns = to_list(sw_call(view, method))
+                        if anns:
+                            break
                     except Exception:
                         pass
+                for ann in anns:
+                    consume_annotation(ann)
+                ann = None
+                for method in ("GetFirstAnnotation3", "GetFirstAnnotation2", "GetFirstAnnotation"):
+                    try:
+                        ann = sw_call(view, method)
+                        if ann is not None:
+                            break
+                    except Exception:
+                        pass
+                count = 0
+                while ann is not None and count < 500:
+                    consume_annotation(ann)
+                    next_ann = None
+                    for method in ("GetNext3", "GetNext2", "GetNext"):
+                        try:
+                            next_ann = sw_call(ann, method)
+                            break
+                        except Exception:
+                            pass
+                    ann = next_ann
+                    count += 1
         except Exception as e:
             logger.debug(f"[Annotations] drawing GetViews traversal failed: {e}")
 

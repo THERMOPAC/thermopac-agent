@@ -71,7 +71,22 @@ def to_list(val: Any) -> list:
     return [val]
 
 
+def as_dispatch(obj: Any) -> Any:
+    if obj is None or win32com is None:
+        return obj
+    try:
+        if getattr(obj, "_oleobj_", None) is not None:
+            return obj
+    except Exception:
+        pass
+    try:
+        return win32com.client.Dispatch(obj)
+    except Exception:
+        return obj
+
+
 def _query_dispatch_interface(obj: Any, interface_names: tuple[str, ...]) -> Any:
+    obj = as_dispatch(obj)
     if obj is None or win32com is None or pythoncom is None:
         return None
     ole = getattr(obj, "_oleobj_", None)
@@ -100,6 +115,7 @@ def _query_dispatch_interface(obj: Any, interface_names: tuple[str, ...]) -> Any
 
 
 def cast_to_drawing_doc(obj: Any) -> Any:
+    obj = as_dispatch(obj)
     if obj is None or win32com is None:
         return obj
     for cast_name in ("IDrawingDoc", "DrawingDoc"):
@@ -113,6 +129,37 @@ def cast_to_drawing_doc(obj: Any) -> Any:
     if queried is not None:
         return queried
     return obj
+
+
+def cast_to_view(obj: Any) -> Any:
+    obj = as_dispatch(obj)
+    if obj is None or win32com is None:
+        return obj
+    for cast_name in ("IView", "View"):
+        try:
+            casted = win32com.client.CastTo(obj, cast_name)
+            if casted is not None:
+                return casted
+        except Exception:
+            pass
+    queried = _query_dispatch_interface(obj, ("IView", "View"))
+    if queried is not None:
+        return queried
+    return obj
+
+
+def get_com_value(obj: Any, names: tuple[str, ...], *args: Any) -> Any:
+    for name in names:
+        try:
+            return sw_call(obj, name, *args)
+        except Exception:
+            pass
+        try:
+            value = getattr(obj, name)
+            return value(*args) if callable(value) else value
+        except Exception:
+            pass
+    return None
 
 
 def get_active_doc(swApp: Any) -> Any:
@@ -155,7 +202,12 @@ def iter_drawing_views(swDraw: Any, sheet_names: list | None = None) -> list[tup
         raw = sw_call(swDraw, "GetViews")
     except Exception:
         return []
-    groups = to_list(raw)
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        groups = list(raw)
+    else:
+        groups = [raw]
     result: list[tuple[str, Any]] = []
     current_sheet = ""
     for idx, group in enumerate(groups):
@@ -170,11 +222,41 @@ def iter_drawing_views(swDraw: Any, sheet_names: list | None = None) -> list[tup
                 values = values[1:]
             for view in values:
                 if view is not None and not isinstance(view, str):
-                    result.append((str(sheet or ""), view))
+                    result.append((str(sheet or ""), cast_to_view(view)))
         elif group is not None:
             sheet = sheet_names[idx] if sheet_names and idx < len(sheet_names) else current_sheet
-            result.append((str(sheet or ""), group))
+            result.append((str(sheet or ""), cast_to_view(group)))
     return result
+
+
+def log_view_object_debug(view: Any, logger: Any, label: str) -> None:
+    summary = com_type_summary(view)
+    logger.info(
+        f"[COMDBG] view {label}: "
+        f"python={summary['python_module']}.{summary['python_type']} "
+        f"typeinfo='{summary['typeinfo_name']}' guid='{summary['typeattr_guid']}' repr='{summary['repr']}'"
+    )
+    for probe_name in (
+        "Name",
+        "Type",
+        "GetType",
+        "GetName2",
+        "GetName",
+        "GetReferencedModelName",
+        "ReferencedDocument",
+        "GetReferencedDocument",
+        "GetAnnotations",
+        "GetDisplayDimensions",
+        "GetFirstDisplayDimension5",
+        "GetFirstDisplayDimension",
+        "GetTableAnnotations",
+    ):
+        probe = probe_method(view, probe_name)
+        logger.info(
+            f"[COMDBG] view {label}.{probe_name}: "
+            f"has={probe['has_attr']} callable={probe['callable']} ok={probe['call_ok']} "
+            f"result={probe['result_type']} preview='{probe['result_preview']}' error='{probe['error']}'"
+        )
 
 
 def com_type_summary(obj: Any) -> dict:

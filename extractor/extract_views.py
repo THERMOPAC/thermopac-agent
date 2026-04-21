@@ -4,13 +4,79 @@ Reads view names, types, scale, and model references from all sheets.
 """
 
 from __future__ import annotations
-from extractor._com_helper import sw_call, to_list, activate_sheet_and_get_current_sheet, iter_drawing_views
+from extractor._com_helper import (
+    get_com_value,
+    iter_drawing_views,
+    log_view_object_debug,
+    sw_call,
+    to_list,
+    activate_sheet_and_get_current_sheet,
+)
 
 SW_VIEW_TYPES = {
     1: "base", 2: "projected", 3: "section", 4: "detail",
     5: "auxiliary", 6: "standard_3view", 7: "relative",
     8: "predefined", 9: "empty",
 }
+
+
+def _view_name(view) -> str:
+    value = get_com_value(view, ("Name", "GetName2", "GetName"))
+    return str(value or "").strip()
+
+
+def _view_type(view) -> str:
+    value = get_com_value(view, ("Type", "GetType"))
+    if value is None:
+        return "unknown"
+    try:
+        value_int = int(value)
+        return SW_VIEW_TYPES.get(value_int, f"type_{value_int}")
+    except Exception:
+        return str(value)
+
+
+def _view_scale(view) -> str:
+    value = get_com_value(view, ("ScaleDecimal", "ScaleRatio"))
+    try:
+        if isinstance(value, (list, tuple)) and len(value) >= 2 and value[0]:
+            return f"{value[0]}:{value[1]}"
+        if value and value > 0:
+            denom = round(1.0 / float(value))
+            return f"1:{denom}"
+    except Exception:
+        pass
+    return ""
+
+
+def _view_model_reference(view) -> str:
+    import os
+    for value in (
+        get_com_value(view, ("GetReferencedModelName", "ReferencedModelName")),
+        get_com_value(view, ("ReferencedDocument", "GetReferencedDocument")),
+    ):
+        try:
+            if not value:
+                continue
+            if isinstance(value, str):
+                return os.path.basename(value)
+            path = get_com_value(value, ("GetPathName", "PathName", "GetTitle", "Title"))
+            if path:
+                return os.path.basename(str(path))
+        except Exception:
+            pass
+    return ""
+
+
+def _view_entry(sheet_name: str, view, logger, label: str) -> dict:
+    log_view_object_debug(view, logger, label)
+    return {
+        "sheet":           str(sheet_name or ""),
+        "view_name":       _view_name(view),
+        "view_type":       _view_type(view),
+        "scale":           _view_scale(view),
+        "model_reference": _view_model_reference(view),
+    }
 
 
 def ExtractViews(swApp, swModel, swDraw, logger) -> list:
@@ -29,109 +95,26 @@ def ExtractViews(swApp, swModel, swDraw, logger) -> list:
                 if not views:
                     continue
 
-                for view in views:
-                    entry = {
-                        "sheet":           str(sheet_name),
-                        "view_name":       "",
-                        "view_type":       "unknown",
-                        "scale":           "",
-                        "model_reference": "",
-                    }
-                    try:
-                        entry["view_name"] = str(sw_call(view, "GetName2") or "")
-                    except Exception:
-                        pass
-                    try:
-                        v_type = view.Type
-                        entry["view_type"] = SW_VIEW_TYPES.get(v_type, f"type_{v_type}")
-                    except Exception:
-                        pass
-                    try:
-                        scale_ratio = view.ScaleDecimal
-                        if scale_ratio and scale_ratio > 0:
-                            denom = round(1.0 / scale_ratio)
-                            entry["scale"] = f"1:{denom}"
-                    except Exception:
-                        pass
-                    try:
-                        ref_model = sw_call(view, "GetReferencedModelName")
-                        if ref_model:
-                            import os
-                            entry["model_reference"] = os.path.basename(ref_model)
-                    except Exception:
-                        pass
-
-                    result.append(entry)
+                for index, view in enumerate(views):
+                    result.append(_view_entry(str(sheet_name), view, logger, f"sheet/{sheet_name}/v{index}"))
 
             except Exception as e:
                 logger.debug(f"[Views] error on sheet '{sheet_name}': {e}")
 
         if not result:
-            for sheet_name, view in iter_drawing_views(swDraw, sheet_names):
-                entry = {
-                    "sheet":           str(sheet_name),
-                    "view_name":       "",
-                    "view_type":       "unknown",
-                    "scale":           "",
-                    "model_reference": "",
-                }
-                try:
-                    entry["view_name"] = str(sw_call(view, "GetName2") or getattr(view, "Name", "") or "")
-                except Exception:
-                    pass
-                try:
-                    v_type = getattr(view, "Type", None)
-                    entry["view_type"] = SW_VIEW_TYPES.get(v_type, f"type_{v_type}")
-                except Exception:
-                    pass
-                try:
-                    scale_ratio = getattr(view, "ScaleDecimal", None)
-                    if scale_ratio and scale_ratio > 0:
-                        denom = round(1.0 / scale_ratio)
-                        entry["scale"] = f"1:{denom}"
-                except Exception:
-                    pass
-                try:
-                    ref_model = sw_call(view, "GetReferencedModelName")
-                    if ref_model:
-                        import os
-                        entry["model_reference"] = os.path.basename(ref_model)
-                except Exception:
-                    pass
-                result.append(entry)
+            for index, (sheet_name, view) in enumerate(iter_drawing_views(swDraw, sheet_names)):
+                result.append(_view_entry(sheet_name, view, logger, f"GetViews/v{index}"))
 
         if not result:
             swView = sw_call(swDraw, "GetFirstView")
             sheet_name = ""
             view_index = 0
             while swView is not None and view_index < 100:
-                entry = {
-                    "sheet": sheet_name,
-                    "view_name": "",
-                    "view_type": "unknown",
-                    "scale": "",
-                    "model_reference": "",
-                }
-                try:
-                    entry["view_name"] = str(sw_call(swView, "GetName2") or getattr(swView, "Name", "") or "")
-                except Exception:
-                    pass
+                entry = _view_entry(sheet_name, swView, logger, f"GetFirstView/v{view_index}")
                 try:
                     if view_index == 0 and not sheet_name:
                         sheet_name = entry["view_name"]
                     entry["sheet"] = sheet_name
-                except Exception:
-                    pass
-                try:
-                    v_type = getattr(swView, "Type", None)
-                    entry["view_type"] = SW_VIEW_TYPES.get(v_type, f"type_{v_type}")
-                except Exception:
-                    pass
-                try:
-                    ref_model = sw_call(swView, "GetReferencedModelName")
-                    if ref_model:
-                        import os
-                        entry["model_reference"] = os.path.basename(ref_model)
                 except Exception:
                     pass
                 result.append(entry)

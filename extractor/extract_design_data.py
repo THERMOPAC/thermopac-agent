@@ -20,7 +20,7 @@ Candidate scoring:
 """
 
 from __future__ import annotations
-from extractor._com_helper import sw_call, to_list, activate_sheet_and_get_current_sheet, iter_drawing_views
+from extractor._com_helper import get_com_value, sw_call, to_list, activate_sheet_and_get_current_sheet, iter_drawing_views
 
 SW_TABLE_ANNOTATION_GENERAL  = 11
 SW_TABLE_ANNOTATION_BOM      = 0
@@ -185,11 +185,18 @@ def _iter_view_tables(swView, path: str, logger, fallback_list: list, titles_fou
     if swView is None:
         return None
     try:
-        view_name = str(swView.Name or "").strip() or "?"
+        view_name = str(get_com_value(swView, ("Name", "GetName2", "GetName")) or "").strip() or "?"
     except Exception:
         view_name = "?"
     try:
-        table_anns = to_list(sw_call(swView, "GetTableAnnotations"))
+        table_anns = []
+        for method in ("GetTableAnnotations", "TableAnnotations"):
+            try:
+                table_anns = to_list(sw_call(swView, method))
+                if table_anns:
+                    break
+            except Exception:
+                pass
     except Exception as e:
         logger.debug(f"[DesignData] {path} GetTableAnnotations error: {e}")
         table_anns = []

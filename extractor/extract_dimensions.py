@@ -5,7 +5,7 @@ Soft failure: errors logged, partial data returned.
 """
 
 from __future__ import annotations
-from extractor._com_helper import sw_call, iter_drawing_views, to_list
+from extractor._com_helper import get_com_value, sw_call, iter_drawing_views, to_list
 
 
 def ExtractDimensions(swApp, swModel, swDraw, logger) -> dict:
@@ -87,36 +87,28 @@ def ExtractDimensions(swApp, swModel, swDraw, logger) -> dict:
             swView = view_queue.pop(0) if view_queue else sw_call(swDraw, "GetFirstView")
             view_index = 0
             while swView is not None and view_index < 100:
+                display_dims = []
+                for method in ("GetDisplayDimensions", "DisplayDimensions"):
+                    try:
+                        display_dims = to_list(sw_call(swView, method))
+                        if display_dims:
+                            break
+                    except Exception:
+                        pass
                 disp_dim = None
-                for method in ("GetFirstDisplayDimension5", "GetFirstDisplayDimension"):
+                for method in ("GetFirstDisplayDimension5", "GetFirstDisplayDimension", "GetFirstDisplayDimension4"):
                     try:
                         disp_dim = sw_call(swView, method)
                         if disp_dim is not None:
                             break
                     except Exception:
                         pass
+                linked_dims = []
                 dim_index = 0
                 while disp_dim is not None and dim_index < 500:
-                    total += 1
-                    if len(sample) < 20:
-                        entry = {"name": "", "value": None, "unit": "mm"}
-                        try:
-                            dim = sw_call(disp_dim, "GetDimension2", 0)
-                            if dim is not None:
-                                try:
-                                    entry["name"] = str(getattr(dim, "FullName", "") or getattr(dim, "Name", "") or "")
-                                except Exception:
-                                    pass
-                                try:
-                                    val = sw_call(dim, "GetSystemValue2", "")
-                                    entry["value"] = round(val * 1000, 4) if val is not None else None
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                        sample.append(entry)
+                    linked_dims.append(disp_dim)
                     next_dim = None
-                    for method in ("GetNext5", "GetNext"):
+                    for method in ("GetNext5", "GetNext4", "GetNext"):
                         try:
                             next_dim = sw_call(disp_dim, method)
                             break
@@ -124,6 +116,25 @@ def ExtractDimensions(swApp, swModel, swDraw, logger) -> dict:
                             pass
                     disp_dim = next_dim
                     dim_index += 1
+                for disp_dim in display_dims + linked_dims:
+                    total += 1
+                    if len(sample) < 20:
+                        entry = {"name": "", "value": None, "unit": "mm"}
+                        dim = get_com_value(disp_dim, ("GetDimension2", "GetDimension"), 0)
+                        if dim is not None:
+                            name = get_com_value(dim, ("FullName", "Name", "GetNameForSelection"))
+                            if name:
+                                entry["name"] = str(name)
+                            val = get_com_value(dim, ("GetSystemValue2", "SystemValue"), "")
+                            try:
+                                entry["value"] = round(float(val) * 1000, 4) if val is not None else None
+                            except Exception:
+                                pass
+                        else:
+                            name = get_com_value(disp_dim, ("GetNameForSelection", "Name"))
+                            if name:
+                                entry["name"] = str(name)
+                        sample.append(entry)
                 if view_queue:
                     swView = view_queue.pop(0)
                 else:
