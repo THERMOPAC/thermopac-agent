@@ -8,6 +8,65 @@ from __future__ import annotations
 from extractor._com_helper import get_com_value, sw_call, iter_drawing_views, to_list
 
 
+def _bool_value(value) -> bool:
+    try:
+        return bool(value() if callable(value) else value)
+    except Exception:
+        return False
+
+
+def _dimension_name(dim, fallback="") -> str:
+    value = get_com_value(dim, ("FullName", "Name", "GetNameForSelection"))
+    return str(value or fallback or "")
+
+
+def _dimension_value_mm(dim):
+    value = get_com_value(dim, ("GetSystemValue2", "SystemValue"), "")
+    try:
+        return round(float(value) * 1000, 4) if value is not None else None
+    except Exception:
+        return None
+
+
+def _dimension_tolerance(dim) -> dict:
+    out = {"type": None, "min_value_mm": None, "max_value_mm": None, "text": ""}
+    tol = get_com_value(dim, ("GetTolerance", "Tolerance"))
+    if tol is None:
+        return out
+    t = get_com_value(tol, ("Type", "GetType"))
+    try:
+        out["type"] = int(t) if t is not None else None
+    except Exception:
+        out["type"] = str(t) if t is not None else None
+    for key, names in (
+        ("min_value_mm", ("MinValue", "GetMinValue", "LowerLimit", "GetLowerLimit")),
+        ("max_value_mm", ("MaxValue", "GetMaxValue", "UpperLimit", "GetUpperLimit")),
+    ):
+        value = get_com_value(tol, names)
+        try:
+            out[key] = round(float(value) * 1000, 4) if value is not None else None
+        except Exception:
+            pass
+    text = get_com_value(tol, ("GetText", "Text", "DisplayValue"))
+    if text:
+        out["text"] = str(text)
+    return out
+
+
+def _is_driven(dim, disp_dim=None) -> bool:
+    for obj in (dim, disp_dim):
+        if obj is None:
+            continue
+        for name in ("IsReference", "Driven", "IsDriven", "Reference"):
+            try:
+                value = getattr(obj, name)
+                if _bool_value(value):
+                    return True
+            except Exception:
+                pass
+    return False
+
+
 def ExtractDimensions(swApp, swModel, swDraw, logger) -> dict:
     result = {
         "total_count":     0,
@@ -60,7 +119,11 @@ def ExtractDimensions(swApp, swModel, swDraw, logger) -> dict:
                             "value": round(val * 1000, 4) if val is not None else None,
                             "unit":  unit,
                             "name":  str(dim_name),
+                            "view": "",
+                            "sheet": "",
                         }
+                        entry["driven"] = _is_driven(dim)
+                        entry["tolerance"] = _dimension_tolerance(dim)
                         sample.append(entry)
                     except Exception:
                         sample.append({"name": str(dim_name), "value": None, "unit": ""})
@@ -82,11 +145,15 @@ def ExtractDimensions(swApp, swModel, swDraw, logger) -> dict:
     if result["total_count"] == 0:
         try:
             total = 0
+            driven = 0
+            tolerance = 0
             sample = []
-            view_queue = [view for _, view in iter_drawing_views(swDraw)]
-            swView = view_queue.pop(0) if view_queue else sw_call(swDraw, "GetFirstView")
+            view_queue = iter_drawing_views(swDraw)
+            current = view_queue.pop(0) if view_queue else ("", sw_call(swDraw, "GetFirstView"))
+            sheet_name, swView = current
             view_index = 0
             while swView is not None and view_index < 100:
+                view_name = str(get_com_value(swView, ("Name", "GetName2", "GetName")) or "")
                 display_dims = []
                 for method in ("GetDisplayDimensions", "DisplayDimensions"):
                     try:
@@ -116,27 +183,40 @@ def ExtractDimensions(swApp, swModel, swDraw, logger) -> dict:
                             pass
                     disp_dim = next_dim
                     dim_index += 1
+                seen_dims = set()
                 for disp_dim in display_dims + linked_dims:
+                    dim_key = repr(disp_dim)
+                    if dim_key in seen_dims:
+                        continue
+                    seen_dims.add(dim_key)
                     total += 1
+                    dim = get_com_value(disp_dim, ("GetDimension2", "GetDimension"), 0)
+                    is_driven = _is_driven(dim, disp_dim)
+                    tol = _dimension_tolerance(dim) if dim is not None else {"type": None, "min_value_mm": None, "max_value_mm": None, "text": ""}
+                    if is_driven:
+                        driven += 1
+                    if tol.get("type") not in (None, 0, "0"):
+                        tolerance += 1
                     if len(sample) < 20:
-                        entry = {"name": "", "value": None, "unit": "mm"}
-                        dim = get_com_value(disp_dim, ("GetDimension2", "GetDimension"), 0)
+                        entry = {
+                            "name": "",
+                            "value": None,
+                            "unit": "mm",
+                            "sheet": str(sheet_name or ""),
+                            "view": view_name,
+                            "driven": is_driven,
+                            "tolerance": tol,
+                        }
                         if dim is not None:
-                            name = get_com_value(dim, ("FullName", "Name", "GetNameForSelection"))
-                            if name:
-                                entry["name"] = str(name)
-                            val = get_com_value(dim, ("GetSystemValue2", "SystemValue"), "")
-                            try:
-                                entry["value"] = round(float(val) * 1000, 4) if val is not None else None
-                            except Exception:
-                                pass
+                            entry["name"] = _dimension_name(dim)
+                            entry["value"] = _dimension_value_mm(dim)
                         else:
                             name = get_com_value(disp_dim, ("GetNameForSelection", "Name"))
                             if name:
                                 entry["name"] = str(name)
                         sample.append(entry)
                 if view_queue:
-                    swView = view_queue.pop(0)
+                    sheet_name, swView = view_queue.pop(0)
                 else:
                     try:
                         swView = sw_call(swView, "GetNextView")
@@ -144,8 +224,10 @@ def ExtractDimensions(swApp, swModel, swDraw, logger) -> dict:
                         break
                 view_index += 1
             result["total_count"] = total
+            result["driven_count"] = driven
+            result["tolerance_count"] = tolerance
             result["sample"] = sample
-            logger.info(f"[Dimensions] display-dimension traversal total={total}")
+            logger.info(f"[Dimensions] display-dimension traversal total={total} driven={driven} tolerance={tolerance}")
         except Exception as e:
             logger.error(f"[Dimensions] display-dimension traversal failed: {e}")
 

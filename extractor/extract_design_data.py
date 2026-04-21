@@ -14,7 +14,7 @@ Table detection strategy (3 paths in priority order):
   C. For all sheet names: try sw_call ActivateSheet + GetCurrentSheet fallback
 
 Candidate scoring:
-  - Content-signature: count DDS field labels in cell text. Accept if score >= 3.
+  - Content-signature: count DDS field labels in cell text. Accept if score >= 1.
   - Title match: table title contains "design data" or "design_data".
   - Last resort fallback: first General Table whose first cell looks like "Parameter".
 """
@@ -22,8 +22,8 @@ Candidate scoring:
 from __future__ import annotations
 from extractor._com_helper import get_com_value, sw_call, to_list, activate_sheet_and_get_current_sheet, iter_drawing_views
 
-SW_TABLE_ANNOTATION_GENERAL  = 11
-SW_TABLE_ANNOTATION_BOM      = 0
+SW_TABLE_ANNOTATION_GENERAL_TYPES  = {0, 11}
+SW_TABLE_ANNOTATION_BOM_TYPES      = {2}
 
 _DDS_FIELD_SIGNATURES = [
     "internal design pressure",
@@ -46,7 +46,7 @@ _DDS_FIELD_SIGNATURES = [
     "nozzle",
 ]
 
-_DDS_SCORE_THRESHOLD = 3
+_DDS_SCORE_THRESHOLD = 1
 _NOTE_SCORE_THRESHOLD = 2
 _TITLE_MATCHES = [
     "design data",
@@ -55,6 +55,7 @@ _TITLE_MATCHES = [
     "equipment data",
     "design",
     "data",
+    "general table",
 ]
 
 
@@ -74,6 +75,7 @@ def ExtractDesignDataTable(swApp, swModel, swDraw, logger) -> dict:
             "source": "table",
             "rows": rows,
             "table_titles_found": table_result.get("table_titles_found", []),
+            "raw_tables": table_result.get("raw_tables", []),
             "fallback_text": [],
             "warnings": table_result.get("warnings", []),
         }
@@ -89,6 +91,7 @@ def ExtractDesignDataTable(swApp, swModel, swDraw, logger) -> dict:
             "source": "notes",
             "rows": [],
             "table_titles_found": table_result.get("table_titles_found", []),
+            "raw_tables": table_result.get("raw_tables", []),
             "fallback_text": notes_result["accepted_text"],
             "note_candidates": notes_result.get("candidates", []),
             "warnings": warnings,
@@ -103,6 +106,7 @@ def ExtractDesignDataTable(swApp, swModel, swDraw, logger) -> dict:
         "source": "missing",
         "rows": [],
         "table_titles_found": table_result.get("table_titles_found", []),
+        "raw_tables": table_result.get("raw_tables", []),
         "fallback_text": [],
         "note_candidates": notes_result.get("candidates", []),
         "warnings": warnings,
@@ -127,7 +131,26 @@ def _score_dds_candidate(table_ann, logger) -> int:
     return sum(1 for sig in _DDS_FIELD_SIGNATURES if sig in text_blob)
 
 
-def _check_table(table_ann, label: str, logger, fallback_list: list, titles_found: list) -> list | None:
+def _read_table_raw(table_ann, logger, label: str, max_rows: int = 30, max_cols: int = 12) -> list:
+    rows = []
+    try:
+        row_count = table_ann.RowCount
+        col_count = table_ann.ColumnCount
+    except Exception:
+        return rows
+    for r in range(min(row_count, max_rows)):
+        cells = []
+        for c in range(min(col_count, max_cols)):
+            try:
+                cells.append(str(sw_call(table_ann, "Text", r, c) or "").strip())
+            except Exception:
+                cells.append("")
+        if any(cells):
+            rows.append(cells)
+    return rows
+
+
+def _check_table(table_ann, label: str, logger, fallback_list: list, titles_found: list, raw_tables: list) -> list | None:
     """Evaluate one table; return rows on match, update fallback_list as side-effect."""
     try:
         t_type = table_ann.Type
@@ -142,13 +165,17 @@ def _check_table(table_ann, label: str, logger, fallback_list: list, titles_foun
     except Exception:
         nrows = ncols = "?"
 
-    titles_found.append({"label": label, "type": t_type, "rows": nrows, "cols": ncols, "title": title})
+    raw_rows = _read_table_raw(table_ann, logger, label)
+    titles_found.append({"label": label, "type": t_type, "rows": nrows, "cols": ncols, "title": title, "raw_preview": raw_rows[:8]})
+    raw_tables.append({"label": label, "type": t_type, "rows": nrows, "cols": ncols, "title": title, "content": raw_rows})
     logger.info(f"[DesignData]   [{label}] table title found: '{title}' type={t_type} size={nrows}x{ncols}")
 
     # Primary: content-signature scoring
     score = _score_dds_candidate(table_ann, logger)
     logger.info(f"[DesignData]   [{label}] DDS score={score}")
-    if score >= _DDS_SCORE_THRESHOLD:
+    is_general = t_type in SW_TABLE_ANNOTATION_GENERAL_TYPES or "general table" in title.lower()
+    is_bom = t_type in SW_TABLE_ANNOTATION_BOM_TYPES or "bom" in title.lower() or "bill of material" in title.lower()
+    if score >= _DDS_SCORE_THRESHOLD and not is_bom:
         logger.info(f"[DesignData] DDS match via content-signature (score={score}, label='{label}')")
         rows = _parse_table(table_ann, logger, label=label)
         if rows:
@@ -158,7 +185,7 @@ def _check_table(table_ann, label: str, logger, fallback_list: list, titles_foun
 
     title_lower = title.lower()
     matched_title = next((k for k in _TITLE_MATCHES if k in title_lower), None)
-    if matched_title:
+    if matched_title and not is_bom:
         logger.info(f"[DesignData] DDS match via similar title keyword '{matched_title}' (title='{title}', label='{label}')")
         rows = _parse_table(table_ann, logger, label=label)
         if rows:
@@ -169,10 +196,11 @@ def _check_table(table_ann, label: str, logger, fallback_list: list, titles_foun
         logger.info(f"[DesignData]   [{label}] REJECT table: title does not match Design/Data keywords and DDS score {score} < {_DDS_SCORE_THRESHOLD}")
 
     # Accumulate fallback candidate (first general table with parameter-like first cell)
-    if t_type == SW_TABLE_ANNOTATION_GENERAL and not fallback_list:
+    if is_general and not fallback_list:
         try:
             header = str(sw_call(table_ann, "Text", 0, 0) or "").lower()
-            if any(k in header for k in ("parameter", "description", "item")):
+            blob = " ".join(" ".join(row) for row in raw_rows).lower()
+            if any(k in blob for k in ("parameter", "description", "item", "design", "pressure", "temperature", "capacity", "material", "shell", "dish")):
                 fallback_list.append((table_ann, label, title))
         except Exception:
             pass
@@ -180,7 +208,7 @@ def _check_table(table_ann, label: str, logger, fallback_list: list, titles_foun
     return None
 
 
-def _iter_view_tables(swView, path: str, logger, fallback_list: list, titles_found: list) -> list | None:
+def _iter_view_tables(swView, path: str, logger, fallback_list: list, titles_found: list, raw_tables: list) -> list | None:
     """Call GetTableAnnotations on a view; score each table; return rows on match."""
     if swView is None:
         return None
@@ -203,7 +231,7 @@ def _iter_view_tables(swView, path: str, logger, fallback_list: list, titles_fou
     n = len(table_anns) if table_anns else 0
     logger.info(f"[DesignData] {path} '{view_name}': {n} table(s)")
     for i, ta in enumerate(table_anns or []):
-        result = _check_table(ta, f"{path}/t{i}", logger, fallback_list, titles_found)
+        result = _check_table(ta, f"{path}/t{i}", logger, fallback_list, titles_found, raw_tables)
         if result is not None:
             return result
     return None
@@ -219,6 +247,7 @@ def _find_design_data_table(swApp, swDraw, logger) -> dict:
 
     fallback_list: list = []
     titles_found: list = []
+    raw_tables: list = []
     warnings: list = []
 
     # ─── Path A: GetCurrentSheet() → GetTableAnnotations() ────────────────
@@ -231,9 +260,9 @@ def _find_design_data_table(swApp, swDraw, logger) -> dict:
                 sheet_tbl_anns = to_list(sw_call(swSheet, "GetTableAnnotations"))
                 logger.info(f"[DesignData] Path A: {len(sheet_tbl_anns)} table(s) on current sheet")
                 for i, ta in enumerate(sheet_tbl_anns or []):
-                    result = _check_table(ta, f"A/sheet/t{i}", logger, fallback_list, titles_found)
+                    result = _check_table(ta, f"A/sheet/t{i}", logger, fallback_list, titles_found, raw_tables)
                     if result is not None:
-                        return {"rows": result, "table_titles_found": titles_found, "warnings": warnings}
+                        return {"rows": result, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
             except Exception as e:
                 logger.warning(f"[DesignData] Path A GetTableAnnotations error: {e}")
         else:
@@ -251,9 +280,9 @@ def _find_design_data_table(swApp, swDraw, logger) -> dict:
         swView = sw_call(swDraw, "GetFirstView")
         view_num = 0
         while swView is not None and view_num < 50:
-            result = _iter_view_tables(swView, f"B/v{view_num}", logger, fallback_list, titles_found)
+            result = _iter_view_tables(swView, f"B/v{view_num}", logger, fallback_list, titles_found, raw_tables)
             if result is not None:
-                return {"rows": result, "table_titles_found": titles_found, "warnings": warnings}
+                return {"rows": result, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
             view_num += 1
             try:
                 swView = sw_call(swView, "GetNextView")
@@ -276,16 +305,16 @@ def _find_design_data_table(swApp, swDraw, logger) -> dict:
                 tbl_anns = to_list(sw_call(swSheet2, "GetTableAnnotations"))
                 logger.info(f"[DesignData] Path C sheet '{sname}': {len(tbl_anns)} table(s)")
                 for i, ta in enumerate(tbl_anns or []):
-                    result = _check_table(ta, f"C/{sname}/t{i}", logger, fallback_list, titles_found)
+                    result = _check_table(ta, f"C/{sname}/t{i}", logger, fallback_list, titles_found, raw_tables)
                     if result is not None:
-                        return {"rows": result, "table_titles_found": titles_found, "warnings": warnings}
+                        return {"rows": result, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
             # Also sweep views after activation
             swView = sw_call(swDraw, "GetFirstView")
             vnum = 0
             while swView is not None and vnum < 30:
-                result = _iter_view_tables(swView, f"C/{sname}/v{vnum}", logger, fallback_list, titles_found)
+                result = _iter_view_tables(swView, f"C/{sname}/v{vnum}", logger, fallback_list, titles_found, raw_tables)
                 if result is not None:
-                    return {"rows": result, "table_titles_found": titles_found, "warnings": warnings}
+                    return {"rows": result, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
                 vnum += 1
                 try:
                     swView = sw_call(swView, "GetNextView")
@@ -298,22 +327,22 @@ def _find_design_data_table(swApp, swDraw, logger) -> dict:
 
     # ─── Fallback candidate ────────────────────────────────────────────────
     for vnum, (_, view) in enumerate(iter_drawing_views(swDraw, sheet_names)):
-        result = _iter_view_tables(view, f"D/GetViews/v{vnum}", logger, fallback_list, titles_found)
+        result = _iter_view_tables(view, f"D/GetViews/v{vnum}", logger, fallback_list, titles_found, raw_tables)
         if result is not None:
-            return {"rows": result, "table_titles_found": titles_found, "warnings": warnings}
+            return {"rows": result, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
 
     if fallback_list:
         table_ann, label, title = fallback_list[0]
         logger.warning(f"[DesignData] Using fallback general table at '{label}' title='{title}'")
         rows = _parse_table(table_ann, logger, label=label)
         if rows:
-            return {"rows": rows, "table_titles_found": titles_found, "warnings": warnings}
+            return {"rows": rows, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
 
     if titles_found:
         logger.info(f"[DesignData] Table scan complete: {len(titles_found)} table candidate(s) found but none accepted")
     else:
         logger.info("[DesignData] Table scan complete: no table titles accessible/found")
-    return {"rows": [], "table_titles_found": titles_found, "warnings": warnings}
+    return {"rows": [], "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
 
 
 def _find_design_data_notes(swApp, swModel, swDraw, logger) -> dict:
@@ -451,7 +480,7 @@ def _parse_table(table_ann, logger, label: str) -> list:
                 continue
             if not param:
                 continue
-            rows.append({"parameter": param, "value": value, "unit": unit})
+            rows.append({"parameter": param, "value": value, "unit": unit, "raw_cells": cells})
         except Exception as e:
             logger.debug(f"[DesignData] row {r} parse error: {e}")
     return rows

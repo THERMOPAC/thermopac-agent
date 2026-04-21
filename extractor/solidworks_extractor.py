@@ -86,8 +86,25 @@ SW_DOC_DRAWING           = 3
 SW_OPEN_SILENT           = 1     # swOpenDocOptions_Silent      — suppresses ALL missing-ref dialogs
 SW_OPEN_READ_ONLY        = 2     # swOpenDocOptions_ReadOnly
 SW_OPEN_VIEW_ONLY        = 4     # swOpenDocOptions_ViewOnly    — Large Design Review, no 3-D load
+SW_OPEN_RAPID_DRAFT      = 8
+SW_OPEN_OVERRIDE_DEFAULT = 64
 SW_OPEN_LOAD_MODEL       = 128   # swOpenDocOptions_LoadModel   — fallback only
 # NOTE: 64 = swOpenDocOptions_OverrideDefaultLoadedData (was wrongly used as SW_OPEN_SILENT before v1.0.4)
+
+_DOC_TYPES = {
+    1: "Part",
+    2: "Assembly",
+    3: "Drawing",
+}
+
+_OPEN_OPTION_NAMES = [
+    (SW_OPEN_SILENT, "Silent"),
+    (SW_OPEN_READ_ONLY, "ReadOnly"),
+    (SW_OPEN_VIEW_ONLY, "ViewOnly/LargeDesignReview"),
+    (SW_OPEN_RAPID_DRAFT, "RapidDraft/DetachedSafe"),
+    (SW_OPEN_OVERRIDE_DEFAULT, "OverrideDefaultLoadedData"),
+    (SW_OPEN_LOAD_MODEL, "LoadModel"),
+]
 
 # swOpenDocError_e decode map (for diagnostics)
 _SW_OPEN_ERRORS = {
@@ -112,6 +129,108 @@ def _decode_sw_error(code: int) -> str:
         return "0 (none)"
     parts = [name for bit, name in _SW_OPEN_ERRORS.items() if code & bit]
     return f"{code} ({', '.join(parts) if parts else 'unknown'})"
+
+
+def _decode_open_options(options: int) -> str:
+    if options == 0:
+        return "0 (none)"
+    names = [name for bit, name in _OPEN_OPTION_NAMES if options & bit]
+    return f"{options} ({' | '.join(names) if names else 'unknown'})"
+
+
+def _reference_load_mode(options: int) -> str:
+    if options & SW_OPEN_VIEW_ONLY:
+        return "deferred/view-only; referenced 3-D model load avoided"
+    if options & SW_OPEN_RAPID_DRAFT:
+        return "detached-safe/rapid-draft; referenced model load minimized"
+    if options & SW_OPEN_LOAD_MODEL:
+        return "forced model load; highest risk of resolved/heavyweight references"
+    if options & SW_OPEN_OVERRIDE_DEFAULT:
+        return "default loaded data overridden; avoids forcing heavyweight references"
+    if options & SW_OPEN_SILENT:
+        return "silent full drawing; references may resolve per SW defaults/search paths"
+    return "interactive full drawing; references may resolve per SW defaults/search paths"
+
+
+def _safe_doc_type(model) -> tuple[int | None, str]:
+    if model is None:
+        return None, "None"
+    try:
+        raw = model.GetType
+        doc_type = raw() if callable(raw) else int(raw)
+        return doc_type, _DOC_TYPES.get(doc_type, f"Unknown({doc_type})")
+    except Exception as e:
+        return None, f"unavailable ({type(e).__name__}: {e})"
+
+
+def _log_open_attempt(logger, api: str, label: str, doc_type: int, options: int | None, mode: str, result, err: int, warn: int):
+    opened_type, opened_type_name = _safe_doc_type(result)
+    requested_type = _DOC_TYPES.get(doc_type, f"Unknown({doc_type})")
+    opt_text = "DocSpec(ReadOnly=True, Silent=True)" if options is None else _decode_open_options(options)
+    ref_mode = mode if mode else (_reference_load_mode(options) if options is not None else "docSpec full drawing; references may resolve per SW defaults/search paths")
+    logger.info(
+        f"[Extractor] {api} {label}: requested_doc_type={doc_type} ({requested_type}) "
+        f"open_options={opt_text} solidworks_open_mode='{ref_mode}' "
+        f"model={'OK' if result else 'None'} opened_doc_type={opened_type_name} "
+        f"errors={_decode_sw_error(err)} warnings={_decode_sw_error(warn)}"
+    )
+
+
+def _log_reference_diagnostics(swApp, temp_path: str, logger, stage: str) -> None:
+    logger.info(f"[Extractor] Reference diagnostics ({stage}) for {os.path.basename(temp_path)}")
+    try:
+        for folder_type in [1, 2, 4, 7]:
+            try:
+                paths = swApp.GetSearchFolders(folder_type)
+                logger.info(f"[Extractor] SearchFolders type={folder_type}: {paths if paths else '(empty)'}")
+            except Exception as e:
+                logger.info(f"[Extractor] SearchFolders type={folder_type}: unavailable ({type(e).__name__}: {e})")
+    except Exception:
+        pass
+    dependency_calls = [
+        ("GetDocumentDependencies2(False, True, False)", lambda: swApp.GetDocumentDependencies2(temp_path, False, True, False)),
+        ("GetDocumentDependencies2(True, True, False)", lambda: swApp.GetDocumentDependencies2(temp_path, True, True, False)),
+        ("GetDocumentDependencies(temp)", lambda: swApp.GetDocumentDependencies(temp_path)),
+    ]
+    for label, fn in dependency_calls:
+        try:
+            deps = fn()
+            if deps is None:
+                logger.info(f"[Extractor] Reference diagnostics {label}: None")
+                continue
+            dep_list = list(deps) if isinstance(deps, (list, tuple)) else [deps]
+            missing = []
+            paths = []
+            for value in dep_list:
+                text = str(value)
+                if text.lower().endswith((".sldprt", ".sldasm", ".slddrw")) or "\\" in text or "/" in text:
+                    paths.append(text)
+                    if text and not os.path.exists(text):
+                        missing.append(text)
+            logger.info(f"[Extractor] Reference diagnostics {label}: entries={len(dep_list)} path_entries={len(paths)} missing_paths={len(missing)}")
+            for item in missing[:30]:
+                logger.warning(f"[Extractor] Missing/problematic referenced model: {item}")
+            if len(missing) > 30:
+                logger.warning(f"[Extractor] Missing/problematic referenced models truncated: {len(missing) - 30} more")
+            return
+        except Exception as e:
+            logger.info(f"[Extractor] Reference diagnostics {label} failed: {type(e).__name__}: {e}")
+
+
+def _set_doc_spec_attr(docSpec, names: tuple[str, ...], value, logger) -> str:
+    for name in names:
+        try:
+            setattr(docSpec, name, value)
+            try:
+                actual = getattr(docSpec, name)
+            except Exception:
+                actual = value
+            logger.info(f"[Extractor] OpenDoc7 docSpec {name}={actual}")
+            return name
+        except Exception:
+            continue
+    logger.info(f"[Extractor] OpenDoc7 docSpec skipped attrs={names} unsupported")
+    return ""
 
 
 def _activate_and_refetch(swApp, swModel, temp_path: str, logger, label: str):
@@ -396,9 +515,8 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         err_val  = 0
         warn_val = 0
 
-        # ── Pass 0: OpenDoc7 with IDocumentSpecification (most control) ───────
-        # docSpec.Silent = True reliably suppresses ALL missing-ref dialogs,
-        # allowing the drawing to open in full mode even without referenced parts.
+        _log_reference_diagnostics(swApp, temp_path, logger, "before-open")
+
         def _close_zombie(label: str):
             """CloseDoc after a failed open attempt to clear SW's internal open-state registry.
             Without this, SW returns AlreadyOpen (65536) for every subsequent attempt on the
@@ -409,53 +527,91 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
             except Exception:
                 pass  # expected if nothing was actually registered
 
-        try:
-            docSpec = swApp.GetOpenDocSpec(temp_path)
-            docSpec.FileName     = temp_path
-            docSpec.DocumentType = SW_DOC_DRAWING
-            docSpec.ReadOnly     = True
-            docSpec.Silent       = True
-            swModel = swApp.OpenDoc7(docSpec)
-            err_val  = docSpec.Error
-            warn_val = docSpec.Warning
-            logger.info(f"[Extractor] OpenDoc7 pass 0: "
-                        f"model={'OK' if swModel else 'None'} "
-                        f"errors={_decode_sw_error(err_val)} "
-                        f"warnings={_decode_sw_error(warn_val)}")
-        except Exception as e:
-            logger.info(f"[Extractor] OpenDoc7 not available ({e}); falling back to OpenDoc6")
-            swModel = None
-        if swModel is None:
-            _close_zombie("OpenDoc7")
+        def _try_refetch(label: str):
+            nonlocal swModel
+            if swModel is not None:
+                return True
+            candidate, draw = _activate_and_refetch(swApp, swModel, temp_path, logger, label)
+            doc_type, _ = _safe_doc_type(candidate)
+            if candidate is not None and doc_type == SW_DOC_DRAWING:
+                logger.info(f"[Extractor] {label}: Open returned None but active document refetch found drawing")
+                swModel = candidate
+                return True
+            try:
+                first_view = probe_method(draw, "GetFirstView")
+                current_sheet = probe_method(draw, "GetCurrentSheet")
+                if candidate is not None and (first_view["call_ok"] or current_sheet["call_ok"]):
+                    logger.info(f"[Extractor] {label}: Open returned None but active document refetch found drawing API")
+                    swModel = candidate
+                    return True
+            except Exception:
+                pass
+            return False
 
-        # ── Passes 1-2: OpenDoc6 with Silent only (no LDR/ViewOnly) ─────────
-        #   Pass 1: Silent | ReadOnly
-        #   Pass D: ReadOnly + auto-dismiss thread (catches missing-ref dialogs)
-        #   Pass 2: Silent | ReadOnly | LoadModel  (last resort full-mode)
-        # LDR / ViewOnly (swOpenDocOptions_ViewOnly) is intentionally excluded —
-        # it opens drawings without full COM interface support, making
-        # IDrawingDoc.GetFirstView() inaccessible.
+        def _open_doc7(label: str, attr_sets: list[tuple[tuple[str, ...], object]], mode: str):
+            nonlocal swModel, err_val, warn_val, pass_num
+            try:
+                docSpec = swApp.GetOpenDocSpec(temp_path)
+                docSpec.FileName     = temp_path
+                docSpec.DocumentType = SW_DOC_DRAWING
+                docSpec.ReadOnly     = True
+                docSpec.Silent       = True
+                logger.info("[Extractor] OpenDoc7 docSpec FileName set")
+                logger.info("[Extractor] OpenDoc7 docSpec DocumentType=3 (Drawing)")
+                logger.info("[Extractor] OpenDoc7 docSpec ReadOnly=True")
+                logger.info("[Extractor] OpenDoc7 docSpec Silent=True")
+                for names, value in attr_sets:
+                    _set_doc_spec_attr(docSpec, names, value, logger)
+                swModel = swApp.OpenDoc7(docSpec)
+                err_val  = docSpec.Error
+                warn_val = docSpec.Warning
+                _log_open_attempt(logger, "OpenDoc7", label, SW_DOC_DRAWING, None, mode, swModel, err_val, warn_val)
+                pass_num = label
+            except Exception as e:
+                logger.info(f"[Extractor] OpenDoc7 {label} not available/failed: {type(e).__name__}: {e}")
+                swModel = None
+            if _try_refetch(f"OpenDoc7 {label} active-refetch"):
+                return True
+            _close_zombie(f"OpenDoc7 {label}")
+            return False
+
+        open_doc7_passes = [
+            ("pass 0 full-silent", [], "docSpec full drawing; references may resolve per SW defaults/search paths"),
+            ("pass L lightweight-default", [
+                (("UseLightWeightDefault", "UseLightweightDefault", "LightWeight", "Lightweight"), True),
+                (("LoadModel", "LoadExternalReferences", "LoadExternalRefs"), False),
+            ], "lightweight/deferred where supported; referenced model load not forced"),
+            ("pass V view-only", [
+                (("ViewOnly", "LargeDesignReview"), True),
+                (("LoadModel", "LoadExternalReferences", "LoadExternalRefs"), False),
+            ], "view-only/large-design-review where supported; referenced 3-D model load avoided"),
+        ]
+        for label, attr_sets, mode in open_doc7_passes:
+            if _open_doc7(label, attr_sets, mode):
+                break
+
         if swModel is None:
-            for pass_num, options in enumerate(
-                [SW_OPEN_READ_ONLY | SW_OPEN_SILENT,
-                 SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_LOAD_MODEL], start=1
-            ):
+            open_doc6_passes = [
+                ("pass 1 full-silent", SW_OPEN_READ_ONLY | SW_OPEN_SILENT),
+                ("pass 2 override-default-loaded-data", SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_OVERRIDE_DEFAULT),
+                ("pass 3 view-only", SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_VIEW_ONLY),
+                ("pass 4 rapid-draft", SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_RAPID_DRAFT),
+                ("pass 5 load-model-last-resort", SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_LOAD_MODEL),
+            ]
+            for label, options in open_doc6_passes:
                 errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
                 warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
                 swModel  = swApp.OpenDoc6(
                     temp_path, SW_DOC_DRAWING, options, "", errors, warnings)
                 err_val  = errors.value
                 warn_val = warnings.value
-                logger.info(f"[Extractor] OpenDoc6 pass {pass_num}: "
-                            f"model={'OK' if swModel else 'None'} "
-                            f"errors={_decode_sw_error(err_val)} "
-                            f"warnings={_decode_sw_error(warn_val)}")
-                if swModel is not None:
+                pass_num = label
+                _log_open_attempt(logger, "OpenDoc6", label, SW_DOC_DRAWING, options, "", swModel, err_val, warn_val)
+                if swModel is not None or _try_refetch(f"OpenDoc6 {label} active-refetch"):
                     break
-                _close_zombie(f"pass {pass_num}")
-                # Insert dialog-dismiss pass between pass 1 and LoadModel
-                if pass_num == 1 and WIN32GUI_AVAILABLE:
-                    logger.info("[Extractor] OpenDoc6 pass D: ReadOnly + auto dialog-dismiss")
+                _close_zombie(label)
+                if label == "pass 1 full-silent" and WIN32GUI_AVAILABLE:
+                    logger.info("[Extractor] OpenDoc6 pass D dialog-dismiss: doc_type=3 (Drawing) open_options=2 (ReadOnly) solidworks_open_mode='interactive full drawing; missing-reference dialogs auto-dismissed'")
                     stop_dismiss = threading.Event()
                     dismisser    = threading.Thread(
                         target=_auto_dismiss_sw_dialogs,
@@ -470,15 +626,13 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                             temp_path, SW_DOC_DRAWING, SW_OPEN_READ_ONLY, "", d_errors, d_warnings)
                         d_err  = d_errors.value
                         d_warn = d_warnings.value
-                        logger.info(f"[Extractor] OpenDoc6 pass D: "
-                                    f"model={'OK' if d_model else 'None'} "
-                                    f"errors={_decode_sw_error(d_err)} "
-                                    f"warnings={_decode_sw_error(d_warn)}")
+                        _log_open_attempt(logger, "OpenDoc6", "pass D dialog-dismiss", SW_DOC_DRAWING, SW_OPEN_READ_ONLY, "", d_model, d_err, d_warn)
                         if d_model is not None:
                             swModel  = d_model
                             err_val  = d_err
                             warn_val = d_warn
-                            pass_num = 'D'
+                            pass_num = "pass D dialog-dismiss"
+                        if swModel is not None or _try_refetch("OpenDoc6 pass D active-refetch"):
                             break
                         _close_zombie("pass D")
                     except Exception as ex_d:
@@ -489,12 +643,13 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                         dismisser.join(timeout=2)
 
         if swModel is None:
+            _log_reference_diagnostics(swApp, temp_path, logger, "after-open-failure")
             raise RuntimeError(
                 f"All open passes failed for {filename}. "
                 f"Last errors={_decode_sw_error(err_val)} warnings={_decode_sw_error(warn_val)}"
             )
 
-        logger.info(f"[Extractor] Document open OK in full mode (pass={pass_num})")
+        logger.info(f"[Extractor] Document open OK (pass={pass_num})")
 
         # ── Verify document type ───────────────────────────────────────────────
         # swDocumentTypes_e: 1=Part, 2=Assembly, 3=Drawing

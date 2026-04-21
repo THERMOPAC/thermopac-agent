@@ -14,7 +14,7 @@ from extractor._com_helper import (
 )
 
 SW_VIEW_TYPES = {
-    1: "base", 2: "projected", 3: "section", 4: "detail",
+    1: "base", 2: "section", 3: "detail", 4: "projected",
     5: "auxiliary", 6: "standard_3view", 7: "relative",
     8: "predefined", 9: "empty",
 }
