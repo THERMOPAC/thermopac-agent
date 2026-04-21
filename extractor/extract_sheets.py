@@ -24,7 +24,7 @@ def ExtractSheets(swApp, swModel, swDraw, logger) -> list:
         for name in sheet_names:
             entry = {"sheet_name": str(name), "scale": "", "paper_size": "", "view_count": 0}
             try:
-                swDraw.ActivateSheet(name)
+                sw_call(swDraw, "ActivateSheet", name)
                 swSheet = sw_call(swDraw, "GetCurrentSheet")
                 if swSheet is None:
                     result.append(entry)

@@ -21,18 +21,20 @@ def sw_call(obj: Any, method: str, *args: Any) -> Any:
 
     Usage:
         sheet_names = sw_call(swDraw, "GetSheetNames")
-        swDraw.ActivateSheet(name)          # ActivateSheet is always a method — call directly
+        sw_call(swDraw, "ActivateSheet", name)
         swSheet = sw_call(swDraw, "GetCurrentSheet")
     """
     attr = getattr(obj, method, None)
     if attr is None:
-        return None
+        raise AttributeError(f"COM method {method} not available")
     if callable(attr):
         try:
             return attr(*args)
         except TypeError:
             # attr may already be the value (property, not method) — return as-is
             return attr
+        except Exception as e:
+            raise RuntimeError(f"COM method {method} failed: {type(e).__name__}: {e}")
     # attr is already the value (PROPERTYGET pre-evaluated)
     return attr
 

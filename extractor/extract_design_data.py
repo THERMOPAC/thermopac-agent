@@ -193,7 +193,7 @@ def _find_design_data_table(swDraw, logger) -> list | None:
                 return result
             view_num += 1
             try:
-                swView = swView.GetNextView()
+                swView = sw_call(swView, "GetNextView")
             except Exception:
                 break
         logger.info(f"[DesignData] Path B: traversed {view_num} view(s)")
@@ -205,7 +205,7 @@ def _find_design_data_table(swDraw, logger) -> list | None:
     logger.info("[DesignData] Path C: per-sheet ActivateSheet sweep")
     for sname in (sheet_names or []):
         try:
-            swDraw.ActivateSheet(sname)
+            sw_call(swDraw, "ActivateSheet", sname)
             logger.info(f"[DesignData] Path C: activated sheet '{sname}'")
             # After activation, try GetCurrentSheet
             swSheet2 = sw_call(swDraw, "GetCurrentSheet")
@@ -225,7 +225,7 @@ def _find_design_data_table(swDraw, logger) -> list | None:
                     return result
                 vnum += 1
                 try:
-                    swView = swView.GetNextView()
+                    swView = sw_call(swView, "GetNextView")
                 except Exception:
                     break
         except Exception as e:

@@ -25,32 +25,34 @@ try:
 except ImportError:
     PYWIN32_AVAILABLE = False
 
-def _ensure_sw_early_binding(progid: str, logger) -> None:
+def _connect_sw_application(progid: str, logger):
     """
-    Ensure the win32com early-binding (makepy) cache exists for SolidWorks.
-
-    Call once before connecting to SolidWorks.  If the cache is already present
-    (gen_py directory populated by a previous makepy run) this returns immediately.
-    If it is absent — or if EnsureDispatch itself fails — a RuntimeError is raised
-    with clear instructions for the operator.
-
-    Do NOT fall back to late-binding: late-binding cannot access IDrawingDoc
-    methods (GetFirstView etc.) that live on a separate COM vtable.
+    Connect to SolidWorks with early binding when available, otherwise fall back
+    to late binding. Some Windows/SolidWorks installations successfully run
+    makepy but still fail EnsureDispatch with "cannot automate the makepy
+    process", so this must not block extraction.
     """
     try:
-        import win32com.client.gencache as gc
-        gc.EnsureDispatch(progid)
-        logger.info("[COM] EnsureDispatch: early-binding cache confirmed")
+        sw_app = win32com.client.gencache.EnsureDispatch(progid)
+        binding_mode = "early"
+        logger.info("[COM] Binding mode: early (EnsureDispatch)")
     except Exception as e:
-        raise RuntimeError(
-            f"SolidWorks early-binding (makepy) cache is not available: {e}\n\n"
-            "Run this command ONCE on the Windows machine to generate the cache:\n"
-            f'    python -m win32com.client.makepy "{progid}"\n\n'
-            "Or open a Python prompt and run:\n"
-            "    import win32com.client\n"
-            f'    win32com.client.gencache.EnsureDispatch("{progid}")\n\n'
-            "After the cache is built, restart the agent."
-        )
+        logger.warning(f"[COM] EnsureDispatch failed: {type(e).__name__}: {e}")
+        sw_app = win32com.client.Dispatch(progid)
+        binding_mode = "late"
+        logger.info("[COM] Binding mode: late (Dispatch)")
+
+    version = "unknown"
+    for attr in ("RevisionNumber", "Version"):
+        try:
+            value = getattr(sw_app, attr)
+            version = value() if callable(value) else value
+            if version:
+                break
+        except Exception:
+            pass
+    logger.info(f"[COM] SolidWorks version detected: {version}")
+    return sw_app, binding_mode
 
 try:
     import win32gui
@@ -255,14 +257,8 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         # ── Inherit search paths from user's running SW session (read-only) ───
         inherited_paths = _get_user_sw_search_paths(config.sw_progid, logger)
 
-        # ── Ensure early-binding cache is ready (hard-fail if not) ───────────
-        # CastTo(swModel, "IDrawingDoc") requires the makepy cache.
-        # If EnsureDispatch fails the operator must run makepy manually once.
-        _ensure_sw_early_binding(config.sw_progid, logger)
-
         logger.info("[Extractor] Connecting to SolidWorks COM…")
-        swApp = win32com.client.gencache.EnsureDispatch(config.sw_progid)
-        logger.info("[Extractor] EnsureDispatch success")
+        swApp, binding_mode = _connect_sw_application(config.sw_progid, logger)
         # Force full COM initialisation so IDrawingDoc interface is fully loaded.
         # Visible=True + UserControl=True + a brief delay ensures SolidWorks has
         # finished its own COM registration before we attempt OpenDoc.
@@ -427,27 +423,24 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
             logger.info(f"[Extractor] Model type: {doc_type} ({type_name})")
             if doc_type != 3:
                 raise RuntimeError(f"Expected swDocDRAWING (3) but got type {doc_type}. Wrong file type.")
+            logger.info("[Extractor] Drawing detected")
         except RuntimeError:
             raise
         except Exception as e:
             logger.warning(f"[Extractor] GetType() skipped: {e} — assuming Drawing and continuing")
 
-        # ── Cast to IDrawingDoc via early-binding ──────────────────────────────
-        # EnsureDispatch (above) guarantees the makepy cache is present.
-        # CastTo uses the cached type info to obtain IDrawingDoc's own vtable,
-        # giving us IDrawingDoc's own vtable — the only way to call GetFirstView.
-        try:
-            swDraw = win32com.client.CastTo(swModel, "IDrawingDoc")
-            logger.info("[Extractor] CastTo IDrawingDoc: OK")
-        except Exception as e:
-            raise RuntimeError(
-                f"CastTo(swModel, 'IDrawingDoc') failed: {e}\n\n"
-                "The early-binding cache may be stale or incomplete. Run:\n"
-                f"    python -m win32com.client.makepy \"{config.sw_progid}\"\n"
-                "then restart the agent."
-            )
+        swDraw = swModel
+        if binding_mode == "early":
+            try:
+                swDraw = win32com.client.CastTo(swModel, "IDrawingDoc")
+                logger.info("[Extractor] CastTo IDrawingDoc: OK")
+            except Exception as e:
+                err_msg = f"{type(e).__name__}: {e}"
+                logger.warning(f"[Extractor] API call failed: CastTo(IDrawingDoc): {err_msg}; continuing best-effort")
+                result["extraction_errors"]["CastTo(IDrawingDoc)"] = err_msg
+        else:
+            logger.info("[Extractor] Late binding active — using opened model object for best-effort drawing extraction")
 
-        # Verify GetFirstView is accessible on the early-bound IDrawingDoc object
         try:
             first_view = swDraw.GetFirstView()
             logger.info(
@@ -455,7 +448,9 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                 + (" (view returned)" if first_view else " (None — may activate sheet first)")
             )
         except Exception as e:
-            raise RuntimeError(f"IDrawingDoc.GetFirstView failed: {e}")
+            err_msg = f"{type(e).__name__}: {e}"
+            logger.warning(f"[Extractor] API call failed: IDrawingDoc.GetFirstView: {err_msg}; continuing best-effort")
+            result["extraction_errors"]["IDrawingDoc.GetFirstView"] = err_msg
 
         # ── Run modules ───────────────────────────────────────────────────────
         modules = [

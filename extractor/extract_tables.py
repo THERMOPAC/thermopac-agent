@@ -27,7 +27,7 @@ def ExtractTables(swApp, swModel, swDraw, logger) -> dict:
 
         for sheet_name in sheet_names:
             try:
-                swDraw.ActivateSheet(sheet_name)
+                sw_call(swDraw, "ActivateSheet", sheet_name)
                 swSheet = sw_call(swDraw, "GetCurrentSheet")
                 if swSheet is None:
                     continue
