@@ -28,38 +28,74 @@ except ImportError:
 # IDrawingDoc IID extracted from sldworks.tlb at runtime — populated by Method C.
 # Used for raw QueryInterface so GetFirstView / sheet traversal work via pure IDispatch
 # without requiring makepy cache seeding or CastTo.
-_sw_drawing_doc_iid = None
+_sw_drawing_doc_iid  = None   # pywintypes.IID of the interface that owns GetFirstView
+_sw_gfv_dispid       = None   # DISPID of GetFirstView on that interface (DISPID fallback)
+_sw_gnv_dispid       = None   # DISPID of GetNextView  (informational / validation)
 
 
 def _extract_sw_interface_iids(tl, logger) -> None:
     """
-    Scan every type in a loaded SolidWorks ITypeLib and cache the IID for
-    IDrawingDoc (and a few others) in module-level variables.
+    Scan the loaded SolidWorks ITypeLib for the interface that contains
+    GetFirstView and cache its IID + key DISPIDs.
 
-    This is the ONLY thing we need from the TypeLib — no gen_py generation,
-    no EnsureModule, no gencache.  A raw QueryInterface with the IID is
-    sufficient to obtain the IDrawingDoc IDispatch vtable.
+    Rules:
+      • Only consider TKIND_INTERFACE (3) or TKIND_DISPATCH (4) entries.
+        Coclasses (5), aliases (6), etc. carry the TypeLib CLSID, not an
+        interface IID, which is why single-name matching fails.
+      • Verify the interface actually exposes GetFirstView as a method; don't
+        assume by name alone.
+      • Also record GetNextView / ActivateSheet DISPIDs for the DISPID
+        fallback path and validation.
     """
-    global _sw_drawing_doc_iid
-    want = {"IDrawingDoc"}
-    found = {}
+    global _sw_drawing_doc_iid, _sw_gfv_dispid, _sw_gnv_dispid
+
+    TKIND_INTERFACE = 3
+    TKIND_DISPATCH  = 4
+
     try:
         count = tl.GetTypeInfoCount()
         for i in range(count):
-            if not want - found.keys():
-                break
             try:
+                tinfo = tl.GetTypeInfo(i)
+                tattr = tinfo.GetTypeAttr()
+
+                if tattr.typekind not in (TKIND_INTERFACE, TKIND_DISPATCH):
+                    continue
+
+                # Scan the function table for GetFirstView / GetNextView
+                gfv_dispid = None
+                gnv_dispid = None
+                for j in range(tattr.cFuncs):
+                    try:
+                        fdesc = tinfo.GetFuncDesc(j)
+                        fname = tinfo.GetNames(fdesc.memid, 1)[0]
+                        if fname == "GetFirstView":
+                            gfv_dispid = fdesc.memid
+                        elif fname == "GetNextView":
+                            gnv_dispid = fdesc.memid
+                    except Exception:
+                        continue
+
+                if gfv_dispid is None:
+                    continue   # not the drawing interface
+
                 name = tl.GetDocumentation(i)[0]
-                if name in want:
-                    tattr = tl.GetTypeInfo(i).GetTypeAttr()
-                    found[name] = tattr.iid   # pywintypes.IID object
+                iid  = tattr.iid
+                logger.info(
+                    f"[Extractor] IDrawingDoc IID: {iid}  "
+                    f"(name={name} typekind={tattr.typekind} "
+                    f"GetFirstView DISPID={gfv_dispid}"
+                    + (f" GetNextView DISPID={gnv_dispid})" if gnv_dispid else ")")
+                )
+                _sw_drawing_doc_iid = iid
+                _sw_gfv_dispid      = gfv_dispid
+                _sw_gnv_dispid      = gnv_dispid
+                return   # stop at first match
+
             except Exception:
                 continue
-        if "IDrawingDoc" in found:
-            _sw_drawing_doc_iid = found["IDrawingDoc"]
-            logger.info(f"[Extractor] IDrawingDoc IID: {_sw_drawing_doc_iid}")
-        else:
-            logger.warning("[Extractor] IDrawingDoc not found in TypeLib scan")
+
+        logger.warning("[Extractor] No TKIND_INTERFACE/DISPATCH with GetFirstView found in TypeLib")
     except Exception as e:
         logger.warning(f"[Extractor] IID extraction failed: {e}")
 
@@ -766,46 +802,66 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         except Exception as e:
             logger.warning(f"[Extractor] GetType() skipped: {e} — assuming Drawing and continuing")
 
-        # ── Obtain IDrawingDoc interface ───────────────────────────────────────
-        # IDrawingDoc methods (GetFirstView, GetNextView, ActivateSheet, …) live
-        # on a SEPARATE IDispatch vtable from IModelDoc2.  Calling them on swModel
-        # fails with "Member not found" because IModelDoc2's IDispatch doesn't
-        # include them.
+        # ── Obtain IDrawingDoc IDispatch via QueryInterface ────────────────────
+        # The COM object returned by OpenDoc6 is typed as IModelDoc2.  Its
+        # IDispatch vtable only maps IModelDoc2 names; GetFirstView / GetNextView
+        # are on the separate IDrawingDoc vtable.
         #
-        # Strategy (no makepy / gencache required):
-        #   1. Raw QueryInterface with the IDrawingDoc IID extracted from sldworks.tlb
-        #      by Method C.  This gives us IDrawingDoc's OWN IDispatch vtable, which
-        #      does expose GetFirstView.  win32com.client.Dispatch() wraps it.
-        #   2. Fallback: use swModel directly (only IModelDoc2 methods available).
+        # Fix for v1.0.30:
+        #   QueryInterface MUST request IID_IDispatch as the second argument so
+        #   pywin32 receives a PyIDispatch it can wrap.  Single-arg QI returns
+        #   a raw PyIUnknown for unknown interfaces, which Dispatch() can't wrap
+        #   → "no interface object registered" error.
         swDraw = None
         if _sw_drawing_doc_iid is not None:
             try:
-                # QI swModel for the IDrawingDoc interface — same COM object, different vtable
-                qi_ptr = swModel._oleobj_.QueryInterface(_sw_drawing_doc_iid)
-                # Wrap the raw IDrawingDoc pointer as a late-binding Dispatch object.
-                # win32com.client.Dispatch() will QI for IDispatch automatically.
-                swDraw = win32com.client.Dispatch(qi_ptr)
-                logger.info("[Extractor] IDrawingDoc via QueryInterface: OK")
+                qi_disp = swModel._oleobj_.QueryInterface(
+                    _sw_drawing_doc_iid,
+                    pythoncom.IID_IDispatch,      # <-- explicit: return as IDispatch
+                )
+                swDraw = win32com.client.Dispatch(qi_disp)
+                logger.info("[Extractor] QueryInterface: OK")
             except Exception as e:
-                logger.warning(f"[Extractor] IDrawingDoc QI failed ({e}); falling back to swModel")
+                logger.warning(f"[Extractor] QI failed ({e}) — will try DISPID fallback")
                 swDraw = None
+
+        # ── DISPID fallback ────────────────────────────────────────────────────
+        # If QI returns the wrong pointer, InvokeTypes with the known DISPID
+        # still calls through the correct vtable offset on the COM object.
+        if swDraw is None and _sw_gfv_dispid is not None:
+            try:
+                raw = swModel._oleobj_.InvokeTypes(
+                    _sw_gfv_dispid,
+                    0,                              # lcid
+                    1,                              # DISPATCH_METHOD
+                    (pythoncom.VT_DISPATCH, 0),     # return type: IDispatch
+                    (),                             # no args
+                )
+                if raw is not None:
+                    # Use swModel as swDraw but patch GetFirstView via InvokeTypes
+                    swDraw = swModel
+                    logger.info("[Extractor] DISPID fallback: GetFirstView reachable via InvokeTypes")
+                else:
+                    logger.warning("[Extractor] DISPID fallback: InvokeTypes returned None")
+            except Exception as e:
+                logger.warning(f"[Extractor] DISPID fallback failed: {e}")
 
         if swDraw is None:
             swDraw = swModel
             logger.warning(
-                "[Extractor] No IDrawingDoc IID available — using swModel directly. "
-                "IDrawingDoc methods (GetFirstView etc.) may not be accessible."
+                "[Extractor] All IDrawingDoc strategies failed — using IModelDoc2 directly. "
+                "IDrawingDoc methods (GetFirstView etc.) will likely be inaccessible."
             )
 
-        # Confirm GetFirstView is accessible on whatever interface we have
+        # Confirm GetFirstView is accessible
         try:
             gfv_fn = getattr(swDraw, "GetFirstView", None)
             if gfv_fn is None or not callable(gfv_fn):
-                raise AttributeError("GetFirstView not found on COM object")
+                raise AttributeError("GetFirstView not in COM dispatch table")
             _test_view = gfv_fn()
             logger.info(
-                f"[Extractor] GetFirstView OK "
-                f"({'view returned' if _test_view else 'None — sheet may not be active yet'})"
+                "[Extractor] GetFirstView: OK"
+                + (" (view returned)" if _test_view else " (None — sheet may not be active yet)")
             )
         except Exception as e:
             raise RuntimeError(f"IDrawingDoc.GetFirstView not accessible: {e}")
