@@ -72,6 +72,53 @@ def ExtractReferences(swApp, swModel, swDraw, logger) -> dict:
             except Exception as e:
                 logger.debug(f"[References] GetReferencedDocuments error: {e}")
 
+        if not result["referenced_models"]:
+            try:
+                drawing_path = ""
+                for name in ("GetPathName", "PathName"):
+                    try:
+                        value = getattr(swModel, name)
+                        drawing_path = str(value() if callable(value) else value or "")
+                        if drawing_path:
+                            break
+                    except Exception:
+                        pass
+                if drawing_path:
+                    deps = None
+                    for call in (
+                        lambda: swApp.GetDocumentDependencies2(drawing_path, False, True, False),
+                        lambda: swApp.GetDocumentDependencies2(drawing_path, True, True, False),
+                        lambda: swApp.GetDocumentDependencies(drawing_path),
+                    ):
+                        try:
+                            deps = call()
+                            if deps:
+                                break
+                        except Exception:
+                            pass
+                    if deps:
+                        dep_list = list(deps) if isinstance(deps, (list, tuple)) else [deps]
+                        seen = set()
+                        missing = 0
+                        for value in dep_list:
+                            text = str(value or "")
+                            if not text:
+                                continue
+                            lower = text.lower()
+                            if not (lower.endswith((".sldprt", ".sldasm", ".slddrw")) or "\\" in text or "/" in text):
+                                continue
+                            basename = os.path.basename(text)
+                            if basename and basename not in seen:
+                                result["referenced_models"].append(basename)
+                                result["total_references"] += 1
+                                seen.add(basename)
+                            if text and not os.path.exists(text):
+                                missing += 1
+                        result["external_references_broken"] = max(result["external_references_broken"], missing)
+                        logger.info(f"[References] dependency fallback models={len(result['referenced_models'])} missing={missing}")
+            except Exception as e:
+                logger.debug(f"[References] dependency fallback error: {e}")
+
     except Exception as e:
         logger.error(f"[References] unexpected error: {e}")
 

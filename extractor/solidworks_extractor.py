@@ -86,9 +86,10 @@ SW_DOC_DRAWING           = 3
 SW_OPEN_SILENT           = 1     # swOpenDocOptions_Silent      — suppresses ALL missing-ref dialogs
 SW_OPEN_READ_ONLY        = 2     # swOpenDocOptions_ReadOnly
 SW_OPEN_VIEW_ONLY        = 4     # swOpenDocOptions_ViewOnly    — Large Design Review, no 3-D load
-SW_OPEN_RAPID_DRAFT      = 8
-SW_OPEN_OVERRIDE_DEFAULT = 64
-SW_OPEN_LOAD_MODEL       = 128   # swOpenDocOptions_LoadModel   — fallback only
+SW_OPEN_RAPID_DRAFT      = 8     # swOpenDocOptions_RapidDraft / Detailing Mode for drawings
+SW_OPEN_LOAD_MODEL       = 16    # swOpenDocOptions_LoadModel — detached drawing model-load fallback only
+SW_OPEN_OVERRIDE_DEFAULT = 64    # swOpenDocOptions_OverrideDefaultLoadLightweight
+SW_OPEN_LOAD_LIGHTWEIGHT = 128   # swOpenDocOptions_LoadLightweight
 # NOTE: 64 = swOpenDocOptions_OverrideDefaultLoadedData (was wrongly used as SW_OPEN_SILENT before v1.0.4)
 
 _DOC_TYPES = {
@@ -101,9 +102,10 @@ _OPEN_OPTION_NAMES = [
     (SW_OPEN_SILENT, "Silent"),
     (SW_OPEN_READ_ONLY, "ReadOnly"),
     (SW_OPEN_VIEW_ONLY, "ViewOnly/LargeDesignReview"),
-    (SW_OPEN_RAPID_DRAFT, "RapidDraft/DetachedSafe"),
-    (SW_OPEN_OVERRIDE_DEFAULT, "OverrideDefaultLoadedData"),
+    (SW_OPEN_RAPID_DRAFT, "RapidDraft/DetailingMode"),
     (SW_OPEN_LOAD_MODEL, "LoadModel"),
+    (SW_OPEN_OVERRIDE_DEFAULT, "OverrideDefaultLoadedData"),
+    (SW_OPEN_LOAD_LIGHTWEIGHT, "LoadLightweight"),
 ]
 
 # swOpenDocError_e decode map (for diagnostics)
@@ -142,11 +144,13 @@ def _reference_load_mode(options: int) -> str:
     if options & SW_OPEN_VIEW_ONLY:
         return "deferred/view-only; referenced 3-D model load avoided"
     if options & SW_OPEN_RAPID_DRAFT:
-        return "detached-safe/rapid-draft; referenced model load minimized"
+        return "detailing/rapid-draft; drawing data loaded while referenced model load is minimized"
     if options & SW_OPEN_LOAD_MODEL:
-        return "forced model load; highest risk of resolved/heavyweight references"
+        return "detached drawing model load; higher risk of resolved/heavyweight references"
+    if (options & SW_OPEN_OVERRIDE_DEFAULT) and (options & SW_OPEN_LOAD_LIGHTWEIGHT):
+        return "override default + load lightweight; avoids forcing heavyweight references"
     if options & SW_OPEN_OVERRIDE_DEFAULT:
-        return "default loaded data overridden; avoids forcing heavyweight references"
+        return "default loaded data overridden; avoids forcing heavyweight references where possible"
     if options & SW_OPEN_SILENT:
         return "silent full drawing; references may resolve per SW defaults/search paths"
     return "interactive full drawing; references may resolve per SW defaults/search paths"
@@ -166,7 +170,7 @@ def _safe_doc_type(model) -> tuple[int | None, str]:
 def _log_open_attempt(logger, api: str, label: str, doc_type: int, options: int | None, mode: str, result, err: int, warn: int):
     opened_type, opened_type_name = _safe_doc_type(result)
     requested_type = _DOC_TYPES.get(doc_type, f"Unknown({doc_type})")
-    opt_text = "DocSpec(ReadOnly=True, Silent=True)" if options is None else _decode_open_options(options)
+    opt_text = "DocSpec(properties logged above)" if options is None else _decode_open_options(options)
     ref_mode = mode if mode else (_reference_load_mode(options) if options is not None else "docSpec full drawing; references may resolve per SW defaults/search paths")
     logger.info(
         f"[Extractor] {api} {label}: requested_doc_type={doc_type} ({requested_type}) "
@@ -176,14 +180,24 @@ def _log_open_attempt(logger, api: str, label: str, doc_type: int, options: int 
     )
 
 
-def _log_reference_diagnostics(swApp, temp_path: str, logger, stage: str) -> None:
+def _log_reference_diagnostics(swApp, temp_path: str, logger, stage: str) -> dict:
     logger.info(f"[Extractor] Reference diagnostics ({stage}) for {os.path.basename(temp_path)}")
+    out = {
+        "stage": stage,
+        "search_folders": {},
+        "dependency_call": "",
+        "dependency_entries": 0,
+        "path_entries": [],
+        "missing_paths": [],
+    }
     try:
         for folder_type in [1, 2, 4, 7]:
             try:
                 paths = swApp.GetSearchFolders(folder_type)
+                out["search_folders"][str(folder_type)] = paths if paths else ""
                 logger.info(f"[Extractor] SearchFolders type={folder_type}: {paths if paths else '(empty)'}")
             except Exception as e:
+                out["search_folders"][str(folder_type)] = f"unavailable ({type(e).__name__}: {e})"
                 logger.info(f"[Extractor] SearchFolders type={folder_type}: unavailable ({type(e).__name__}: {e})")
     except Exception:
         pass
@@ -207,14 +221,19 @@ def _log_reference_diagnostics(swApp, temp_path: str, logger, stage: str) -> Non
                     paths.append(text)
                     if text and not os.path.exists(text):
                         missing.append(text)
+            out["dependency_call"] = label
+            out["dependency_entries"] = len(dep_list)
+            out["path_entries"] = paths[:200]
+            out["missing_paths"] = missing[:200]
             logger.info(f"[Extractor] Reference diagnostics {label}: entries={len(dep_list)} path_entries={len(paths)} missing_paths={len(missing)}")
             for item in missing[:30]:
                 logger.warning(f"[Extractor] Missing/problematic referenced model: {item}")
             if len(missing) > 30:
                 logger.warning(f"[Extractor] Missing/problematic referenced models truncated: {len(missing) - 30} more")
-            return
+            return out
         except Exception as e:
             logger.info(f"[Extractor] Reference diagnostics {label} failed: {type(e).__name__}: {e}")
+    return out
 
 
 def _set_doc_spec_attr(docSpec, names: tuple[str, ...], value, logger) -> str:
@@ -515,7 +534,12 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         err_val  = 0
         warn_val = 0
 
-        _log_reference_diagnostics(swApp, temp_path, logger, "before-open")
+        open_diagnostics = {
+            "file_size_bytes": file_size,
+            "open_pass": "",
+            "open_mode": "",
+            "reference_diagnostics": _log_reference_diagnostics(swApp, temp_path, logger, "before-open"),
+        }
 
         def _close_zombie(label: str):
             """CloseDoc after a failed open attempt to clear SW's internal open-state registry.
@@ -548,17 +572,17 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                 pass
             return False
 
-        def _open_doc7(label: str, attr_sets: list[tuple[tuple[str, ...], object]], mode: str):
+        def _open_doc7(label: str, attr_sets: list[tuple[tuple[str, ...], object]], mode: str, read_only: bool = True):
             nonlocal swModel, err_val, warn_val, pass_num
             try:
                 docSpec = swApp.GetOpenDocSpec(temp_path)
                 docSpec.FileName     = temp_path
                 docSpec.DocumentType = SW_DOC_DRAWING
-                docSpec.ReadOnly     = True
+                docSpec.ReadOnly     = read_only
                 docSpec.Silent       = True
                 logger.info("[Extractor] OpenDoc7 docSpec FileName set")
                 logger.info("[Extractor] OpenDoc7 docSpec DocumentType=3 (Drawing)")
-                logger.info("[Extractor] OpenDoc7 docSpec ReadOnly=True")
+                logger.info(f"[Extractor] OpenDoc7 docSpec ReadOnly={read_only}")
                 logger.info("[Extractor] OpenDoc7 docSpec Silent=True")
                 for names, value in attr_sets:
                     _set_doc_spec_attr(docSpec, names, value, logger)
@@ -567,6 +591,7 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                 warn_val = docSpec.Warning
                 _log_open_attempt(logger, "OpenDoc7", label, SW_DOC_DRAWING, None, mode, swModel, err_val, warn_val)
                 pass_num = label
+                open_diagnostics["open_mode"] = mode
             except Exception as e:
                 logger.info(f"[Extractor] OpenDoc7 {label} not available/failed: {type(e).__name__}: {e}")
                 swModel = None
@@ -576,27 +601,43 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
             return False
 
         open_doc7_passes = [
-            ("pass 0 full-silent", [], "docSpec full drawing; references may resolve per SW defaults/search paths"),
+            ("pass 0 full-silent", [], "docSpec full drawing; references may resolve per SW defaults/search paths", True),
             ("pass L lightweight-default", [
                 (("UseLightWeightDefault", "UseLightweightDefault", "LightWeight", "Lightweight"), True),
                 (("LoadModel", "LoadExternalReferences", "LoadExternalRefs"), False),
-            ], "lightweight/deferred where supported; referenced model load not forced"),
+                (("OpenDocOptions", "Options"), SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_OVERRIDE_DEFAULT | SW_OPEN_LOAD_LIGHTWEIGHT),
+            ], "lightweight/deferred where supported; referenced model load not forced", True),
+            ("pass R detailing-readonly", [
+                (("DetailingMode", "RapidDraft"), True),
+                (("ViewOnly", "LargeDesignReview"), False),
+                (("LoadModel", "LoadExternalReferences", "LoadExternalRefs"), False),
+                (("OpenDocOptions", "Options"), SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_RAPID_DRAFT),
+            ], "detailing/rapid-draft read-only; drawing annotations/dimensions should remain available without resolving models", True),
+            ("pass R2 detailing-editable-temp", [
+                (("DetailingMode", "RapidDraft"), True),
+                (("ViewOnly", "LargeDesignReview"), False),
+                (("LoadModel", "LoadExternalReferences", "LoadExternalRefs"), False),
+                (("OpenDocOptions", "Options"), SW_OPEN_SILENT | SW_OPEN_RAPID_DRAFT),
+            ], "detailing/rapid-draft editable temp copy; deeper drawing APIs without saving or loading heavyweight models", False),
             ("pass V view-only", [
                 (("ViewOnly", "LargeDesignReview"), True),
+                (("DetailingMode", "RapidDraft"), False),
                 (("LoadModel", "LoadExternalReferences", "LoadExternalRefs"), False),
-            ], "view-only/large-design-review where supported; referenced 3-D model load avoided"),
+                (("OpenDocOptions", "Options"), SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_VIEW_ONLY),
+            ], "view-only/large-design-review where supported; referenced 3-D model load avoided", True),
         ]
-        for label, attr_sets, mode in open_doc7_passes:
-            if _open_doc7(label, attr_sets, mode):
+        for label, attr_sets, mode, read_only in open_doc7_passes:
+            if _open_doc7(label, attr_sets, mode, read_only):
                 break
 
         if swModel is None:
             open_doc6_passes = [
                 ("pass 1 full-silent", SW_OPEN_READ_ONLY | SW_OPEN_SILENT),
-                ("pass 2 override-default-loaded-data", SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_OVERRIDE_DEFAULT),
-                ("pass 3 view-only", SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_VIEW_ONLY),
-                ("pass 4 rapid-draft", SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_RAPID_DRAFT),
-                ("pass 5 load-model-last-resort", SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_LOAD_MODEL),
+                ("pass 2 override-load-lightweight", SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_OVERRIDE_DEFAULT | SW_OPEN_LOAD_LIGHTWEIGHT),
+                ("pass 3 detailing-rapid-draft", SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_RAPID_DRAFT),
+                ("pass 4 detailing-rapid-draft-editable-temp", SW_OPEN_SILENT | SW_OPEN_RAPID_DRAFT),
+                ("pass 5 view-only", SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_VIEW_ONLY),
+                ("pass 6 detached-load-model-last-resort", SW_OPEN_READ_ONLY | SW_OPEN_SILENT | SW_OPEN_LOAD_MODEL),
             ]
             for label, options in open_doc6_passes:
                 errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
@@ -606,6 +647,7 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                 err_val  = errors.value
                 warn_val = warnings.value
                 pass_num = label
+                open_diagnostics["open_mode"] = _reference_load_mode(options)
                 _log_open_attempt(logger, "OpenDoc6", label, SW_DOC_DRAWING, options, "", swModel, err_val, warn_val)
                 if swModel is not None or _try_refetch(f"OpenDoc6 {label} active-refetch"):
                     break
@@ -643,13 +685,15 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                         dismisser.join(timeout=2)
 
         if swModel is None:
-            _log_reference_diagnostics(swApp, temp_path, logger, "after-open-failure")
+            open_diagnostics["reference_diagnostics_after_failure"] = _log_reference_diagnostics(swApp, temp_path, logger, "after-open-failure")
             raise RuntimeError(
                 f"All open passes failed for {filename}. "
                 f"Last errors={_decode_sw_error(err_val)} warnings={_decode_sw_error(warn_val)}"
             )
 
         logger.info(f"[Extractor] Document open OK (pass={pass_num})")
+        open_diagnostics["open_pass"] = str(pass_num)
+        result["open_diagnostics"] = open_diagnostics
 
         # ── Verify document type ───────────────────────────────────────────────
         # swDocumentTypes_e: 1=Part, 2=Assembly, 3=Drawing
