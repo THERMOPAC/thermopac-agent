@@ -25,79 +25,32 @@ try:
 except ImportError:
     PYWIN32_AVAILABLE = False
 
-# IDrawingDoc IID extracted from sldworks.tlb at runtime — populated by Method C.
-# Used for raw QueryInterface so GetFirstView / sheet traversal work via pure IDispatch
-# without requiring makepy cache seeding or CastTo.
-_sw_drawing_doc_iid  = None   # pywintypes.IID of the interface that owns GetFirstView
-_sw_gfv_dispid       = None   # DISPID of GetFirstView on that interface (DISPID fallback)
-_sw_gnv_dispid       = None   # DISPID of GetNextView  (informational / validation)
-
-
-def _extract_sw_interface_iids(tl, logger) -> None:
+def _ensure_sw_early_binding(progid: str, logger) -> None:
     """
-    Scan the loaded SolidWorks ITypeLib for the interface that contains
-    GetFirstView and cache its IID + key DISPIDs.
+    Ensure the win32com early-binding (makepy) cache exists for SolidWorks.
 
-    Rules:
-      • Only consider TKIND_INTERFACE (3) or TKIND_DISPATCH (4) entries.
-        Coclasses (5), aliases (6), etc. carry the TypeLib CLSID, not an
-        interface IID, which is why single-name matching fails.
-      • Verify the interface actually exposes GetFirstView as a method; don't
-        assume by name alone.
-      • Also record GetNextView / ActivateSheet DISPIDs for the DISPID
-        fallback path and validation.
+    Call once before connecting to SolidWorks.  If the cache is already present
+    (gen_py directory populated by a previous makepy run) this returns immediately.
+    If it is absent — or if EnsureDispatch itself fails — a RuntimeError is raised
+    with clear instructions for the operator.
+
+    Do NOT fall back to late-binding: late-binding cannot access IDrawingDoc
+    methods (GetFirstView etc.) that live on a separate COM vtable.
     """
-    global _sw_drawing_doc_iid, _sw_gfv_dispid, _sw_gnv_dispid
-
-    TKIND_INTERFACE = 3
-    TKIND_DISPATCH  = 4
-
     try:
-        count = tl.GetTypeInfoCount()
-        for i in range(count):
-            try:
-                tinfo = tl.GetTypeInfo(i)
-                tattr = tinfo.GetTypeAttr()
-
-                if tattr.typekind not in (TKIND_INTERFACE, TKIND_DISPATCH):
-                    continue
-
-                # Scan the function table for GetFirstView / GetNextView
-                gfv_dispid = None
-                gnv_dispid = None
-                for j in range(tattr.cFuncs):
-                    try:
-                        fdesc = tinfo.GetFuncDesc(j)
-                        fname = tinfo.GetNames(fdesc.memid, 1)[0]
-                        if fname == "GetFirstView":
-                            gfv_dispid = fdesc.memid
-                        elif fname == "GetNextView":
-                            gnv_dispid = fdesc.memid
-                    except Exception:
-                        continue
-
-                if gfv_dispid is None:
-                    continue   # not the drawing interface
-
-                name = tl.GetDocumentation(i)[0]
-                iid  = tattr.iid
-                logger.info(
-                    f"[Extractor] IDrawingDoc IID: {iid}  "
-                    f"(name={name} typekind={tattr.typekind} "
-                    f"GetFirstView DISPID={gfv_dispid}"
-                    + (f" GetNextView DISPID={gnv_dispid})" if gnv_dispid else ")")
-                )
-                _sw_drawing_doc_iid = iid
-                _sw_gfv_dispid      = gfv_dispid
-                _sw_gnv_dispid      = gnv_dispid
-                return   # stop at first match
-
-            except Exception:
-                continue
-
-        logger.warning("[Extractor] No TKIND_INTERFACE/DISPATCH with GetFirstView found in TypeLib")
+        import win32com.client.gencache as gc
+        gc.EnsureDispatch(progid)
+        logger.info("[COM] EnsureDispatch: early-binding cache confirmed")
     except Exception as e:
-        logger.warning(f"[Extractor] IID extraction failed: {e}")
+        raise RuntimeError(
+            f"SolidWorks early-binding (makepy) cache is not available: {e}\n\n"
+            "Run this command ONCE on the Windows machine to generate the cache:\n"
+            f'    python -m win32com.client.makepy "{progid}"\n\n'
+            "Or open a Python prompt and run:\n"
+            "    import win32com.client\n"
+            f'    win32com.client.gencache.EnsureDispatch("{progid}")\n\n'
+            "After the cache is built, restart the agent."
+        )
 
 try:
     import win32gui
@@ -151,299 +104,6 @@ def _decode_sw_error(code: int) -> str:
     return f"{code} ({', '.join(parts) if parts else 'unknown'})"
 
 
-def _prepare_sw_makepy_cache(progid: str, logger) -> None:
-    """
-    Seed win32com early-binding (makepy) cache for SolidWorks before calling
-    gencache.EnsureDispatch().  Three methods attempted in order; first success wins.
-
-    Method A — CLSID chain (registry only, no file I/O):
-        ProgID → CLSID → TypeLib CLSID → gencache.EnsureModule(clsid, 0, maj, min)
-
-    Method B — TLB file from registry:
-        TypeLib\{CLSID}\{version}\0\{win64|win32} → full file path →
-        pythoncom.LoadTypeLib(path) + gencache.EnsureModule with explicit ITypeLib
-
-    Method C — Known SOLIDWORKS install directories:
-        Checks the SolidWorks install path from
-        HKLM\SOFTWARE\SolidWorks\SolidWorks {year}\Setup\SldWorks dir
-        and looks for sldworks.exe (contains embedded TLB) or any *.tlb.
-
-    Raises RuntimeError with remediation steps if all methods fail.
-    """
-    try:
-        import winreg
-        import pythoncom
-    except ImportError:
-        raise RuntimeError(
-            "pywin32 (winreg/pythoncom) is not installed. "
-            "Run: pip install pywin32   then: python -m win32com.client.makepy"
-        )
-
-    def _enum_typelib_versions(tl_clsid: str):
-        """Return sorted list of (major, minor, ver_str) from TypeLib registry.
-        Non-numeric sub-keys (e.g. 'lib.3', 'Helpdir') are silently skipped."""
-        versions = []
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"TypeLib\\{tl_clsid}") as k:
-            i = 0
-            while True:
-                try:
-                    ver_str = winreg.EnumKey(k, i); i += 1
-                    parts = ver_str.split(".")
-                    try:
-                        maj = int(parts[0])
-                        min_ = int(parts[1]) if len(parts) > 1 else 0
-                        versions.append((maj, min_, ver_str))
-                    except ValueError:
-                        # sub-key is not a version number (e.g. 'lb.3', 'FLAGS')
-                        logger.debug(f"[Makepy] Skipping non-numeric TypeLib sub-key: {ver_str!r}")
-                except OSError:
-                    break
-        return sorted(versions)
-
-    def _resolve_tl_clsid(progid: str):
-        """ProgID → app CLSID → TypeLib CLSID"""
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"{progid}\\CLSID") as k:
-            app_clsid = winreg.QueryValue(k, "")
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"CLSID\\{app_clsid}\\TypeLib") as k:
-            tl_clsid = winreg.QueryValue(k, "")
-        return app_clsid, tl_clsid
-
-    # ── Method A: ProgID → CLSID → TypeLib CLSID → EnsureModule ─────────
-    try:
-        app_clsid, tl_clsid = _resolve_tl_clsid(progid)
-        logger.info(f"[Makepy-A] CLSID: {app_clsid}  TypeLib: {tl_clsid}")
-
-        versions = _enum_typelib_versions(tl_clsid)
-        if not versions:
-            raise ValueError(f"No numeric version sub-keys under TypeLib\\{tl_clsid}")
-        major, minor, ver_str = versions[-1]
-        logger.info(f"[Makepy-A] TypeLib version: {major}.{minor}")
-
-        win32com.client.gencache.EnsureModule(tl_clsid, 0, major, minor)
-        logger.info("[Makepy-A] Success — early-binding cache seeded via CLSID chain")
-        return
-
-    except Exception as e:
-        logger.warning(f"[Makepy-A] Failed: {e}")
-
-    # ── Method B: LocalServer32 → LoadTypeLib on sldworks.exe directly ───
-    # SolidWorks 2019+ embeds its TypeLib as a resource inside sldworks.exe.
-    # There is NO standalone .tlb file and the TypeLib registry entry often has
-    # no file-path sub-key.  The CLSID\{app_clsid}\LocalServer32 key always
-    # points to the real sldworks.exe — LoadTypeLib handles resource-embedded
-    # TLBs transparently.
-    try:
-        app_clsid, tl_clsid = _resolve_tl_clsid(progid)
-
-        # Get the actual sldworks.exe path from LocalServer32
-        exe_path = None
-        for key_path in (
-            f"CLSID\\{app_clsid}\\LocalServer32",
-            f"WOW6432Node\\CLSID\\{app_clsid}\\LocalServer32",
-        ):
-            try:
-                with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, key_path) as k:
-                    raw = winreg.QueryValue(k, "").strip('"').split('"')[0].strip()
-                    raw = raw.split(" /")[0].strip()   # strip any CLI flags
-                if raw and os.path.isfile(raw):
-                    exe_path = raw; break
-            except OSError:
-                continue
-
-        if not exe_path:
-            raise ValueError(f"LocalServer32 for {app_clsid} not found or file missing")
-
-        logger.info(f"[Makepy-B] Loading TypeLib from: {exe_path}")
-        tl = pythoncom.LoadTypeLib(exe_path)
-        tla = tl.GetLibAttr()
-        clsid_b = str(tla[0]); major_b = tla[3]; minor_b = tla[4]
-        logger.info(f"[Makepy-B] TypeLib attrs: {clsid_b}  v{major_b}.{minor_b}")
-        # Pass the ITypeLib object (not the CLSID string) so EnsureModule
-        # uses the already-loaded library without going back to the registry.
-        win32com.client.gencache.EnsureModule(
-            tl, 0, major_b, minor_b, bForDemand=False, bBuildHidden=True)
-        logger.info("[Makepy-B] Success — cache seeded via sldworks.exe LocalServer32")
-        return
-
-    except Exception as e:
-        logger.warning(f"[Makepy-B] Failed: {e}")
-
-    # ── Method C: year-based registry scan + LocalServer32 fallback ───────
-    try:
-        sw_dirs = []
-
-        # Primary: look up SolidWorks install dir by year
-        for year in range(2024, 2016, -1):
-            for hive in (winreg.HKEY_LOCAL_MACHINE,):
-                for base in (
-                    f"SOFTWARE\\SolidWorks\\SolidWorks {year}\\Setup",
-                    f"SOFTWARE\\WOW6432Node\\SolidWorks\\SolidWorks {year}\\Setup",
-                    f"SOFTWARE\\SolidWorks\\SOLIDWORKS {year}\\Setup",
-                    f"SOFTWARE\\WOW6432Node\\SolidWorks\\SOLIDWORKS {year}\\Setup",
-                ):
-                    try:
-                        with winreg.OpenKey(hive, base) as k:
-                            d = winreg.QueryValueEx(k, "SldWorks dir")[0]
-                            if d and os.path.isdir(d) and d not in sw_dirs:
-                                sw_dirs.append(d)
-                    except OSError:
-                        pass
-
-        # Fallback: derive install dir from CLSID LocalServer32 (always reliable)
-        try:
-            app_clsid2, _ = _resolve_tl_clsid(progid)
-            for kp in (f"CLSID\\{app_clsid2}\\LocalServer32",
-                       f"WOW6432Node\\CLSID\\{app_clsid2}\\LocalServer32"):
-                try:
-                    with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, kp) as k:
-                        raw = winreg.QueryValue(k, "").strip('"').split('"')[0].strip()
-                        raw = raw.split(" /")[0].strip()
-                    d = os.path.dirname(raw)
-                    if d and os.path.isdir(d) and d not in sw_dirs:
-                        sw_dirs.append(d)
-                        logger.info(f"[Makepy-C] SW dir via LocalServer32: {d}")
-                    break
-                except OSError:
-                    pass
-        except Exception:
-            pass
-
-        if not sw_dirs:
-            raise ValueError("SolidWorks install dir not found via any registry path")
-
-        for sw_dir in sw_dirs:
-            tlb_files = [f for f in os.listdir(sw_dir) if f.lower().endswith(".tlb")]
-            exe_files = [f for f in os.listdir(sw_dir)
-                         if f.lower() in ("sldworks.exe", "sldworks_worker.exe")]
-            candidates = [os.path.join(sw_dir, f) for f in tlb_files + exe_files]
-
-            # Sort: sldworks* first, then other TLBs, then EXEs
-            def _c_sort_key(p):
-                b = os.path.basename(p).lower()
-                if b.startswith("sldworks") and b.endswith(".tlb"): return 0
-                if b.endswith(".tlb"): return 1
-                return 2
-            candidates.sort(key=_c_sort_key)
-
-            # Also scan one level of subdirectories (lang\english, api, etc.)
-            for sub in ("lang\\english", "lang", "api", "setup"):
-                sub_dir = os.path.join(sw_dir, sub)
-                if os.path.isdir(sub_dir):
-                    for f in os.listdir(sub_dir):
-                        if f.lower().endswith(".tlb"):
-                            p = os.path.join(sub_dir, f)
-                            if p not in candidates:
-                                candidates.append(p)
-
-            for candidate in candidates:
-                if not os.path.isfile(candidate):
-                    continue
-                try:
-                    tl = pythoncom.LoadTypeLib(candidate)
-                    tla = tl.GetLibAttr()
-                    clsid_c = str(tla[0]); major_c = tla[3]; minor_c = tla[4]
-                    # Only accept TLBs whose CLSID matches the expected SolidWorks TypeLib
-                    if tl_clsid and clsid_c.upper() != tl_clsid.upper():
-                        logger.debug(f"[Makepy-C] {os.path.basename(candidate)}: "
-                                     f"CLSID {clsid_c} ≠ {tl_clsid} — skipping")
-                        continue
-                    # Extract IDrawingDoc IID first — this is the critical output.
-                    # IID is used for raw QueryInterface later; no gencache needed.
-                    _extract_sw_interface_iids(tl, logger)
-                    # Also attempt EnsureModule (bonus early-binding; non-fatal if it fails)
-                    try:
-                        win32com.client.gencache.EnsureModule(
-                            tl, 0, major_c, minor_c,
-                            bForDemand=False, bBuildHidden=True)
-                        logger.info(f"[Makepy-C] Cache seeded from {candidate}")
-                    except Exception as em:
-                        logger.debug(f"[Makepy-C] EnsureModule skipped: {em}")
-                    logger.info(f"[Makepy-C] TLB loaded — IID extracted from {candidate}")
-                    return
-                except Exception as ce:
-                    logger.debug(f"[Makepy-C] {candidate} skipped: {ce}")
-                    continue
-
-        raise ValueError("No usable SolidWorks TLB/EXE found in install directories")
-
-    except Exception as e:
-        logger.warning(f"[Makepy-C] Failed: {e}")
-
-    # ── Method D: subprocess makepy as a last resort ──────────────────────
-    # Runs the REAL python interpreter (not the PyInstaller bundle EXE) so that
-    # win32com.client.makepy can actually execute.  When frozen, sys.executable
-    # is the EXE itself — useless here.  Look for the bundled Python first.
-    try:
-        import subprocess, sys
-        py_exe = None
-        if getattr(sys, "frozen", False):
-            # Running inside PyInstaller — find bundled Python alongside EXE
-            exe_dir = os.path.dirname(sys.executable)
-            for candidate in (
-                os.path.join(exe_dir, "python", "python.exe"),  # bundled by installer
-                os.path.join(exe_dir, "python.exe"),
-            ):
-                if os.path.isfile(candidate):
-                    py_exe = candidate
-                    break
-        else:
-            py_exe = sys.executable
-
-        if not py_exe:
-            raise FileNotFoundError("No Python interpreter found for makepy subprocess")
-
-        logger.info(f"[Makepy-D] Trying subprocess makepy via: {py_exe}")
-        result = subprocess.run(
-            [py_exe, "-m", "win32com.client.makepy", progid],
-            capture_output=True, text=True, timeout=90
-        )
-        if result.returncode == 0:
-            logger.info("[Makepy-D] Success — subprocess makepy completed")
-            return
-        raise RuntimeError(result.stderr.strip() or f"exit code {result.returncode}")
-
-    except Exception as e:
-        logger.warning(f"[Makepy-D] Failed: {e}")
-
-    # ── All makepy methods exhausted — log clearly, do NOT abort ─────────
-    # The EnsureDispatch call below will still attempt its own cache build.
-    # Many SolidWorks 2019-2021 installs work fine with late-binding Dispatch.
-    logger.warning(
-        "[Makepy] All cache-seeding methods failed — will attempt late-binding.\n"
-        "  To fix permanently run:  python -m win32com.client.makepy "
-        f'"{progid}"'
-    )
-
-
-def _seed_makepy_from_com_object(com_obj, logger) -> bool:
-    """
-    Method E (post-connect): Extract the TypeLib directly from the running COM
-    object via IDispatch.GetTypeInfo().  The COM server must expose its type
-    information through IDispatch — SolidWorks always does.
-
-    This is the most reliable approach: it bypasses all registry/file-system
-    lookup and asks the object itself for its type library.  If the pre-connect
-    methods (A-D) all failed, this runs after swApp = Dispatch() succeeds.
-
-    On success the gencache is seeded so subsequent CastTo(swModel, "IDrawingDoc")
-    calls work correctly.
-    """
-    try:
-        # IDispatch.GetTypeInfo(typeInfoNumber=0, lcid=0) → ITypeInfo
-        tinfo = com_obj._oleobj_.GetTypeInfo(0, 0)
-        # ITypeInfo.GetContainingTypeLib() → (ITypeLib, indexInTypeLib)
-        tlib, _ = tinfo.GetContainingTypeLib()
-        tla = tlib.GetLibAttr()
-        clsid_e = str(tla[0]); major_e = tla[3]; minor_e = tla[4]
-        logger.info(f"[Makepy-E] COM object TypeLib: {clsid_e}  v{major_e}.{minor_e}")
-        # Pass the ITypeLib object directly — bypasses registry lookup
-        win32com.client.gencache.EnsureModule(
-            tlib, 0, major_e, minor_e, bForDemand=False, bBuildHidden=True)
-        logger.info("[Makepy-E] Post-connect cache seeded — CastTo now available")
-        return True
-    except Exception as e:
-        logger.warning(f"[Makepy-E] Post-connect TypeLib extraction failed: {e}")
-        return False
 
 
 def _get_user_sw_search_paths(progid: str, logger) -> dict:
@@ -595,35 +255,14 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         # ── Inherit search paths from user's running SW session (read-only) ───
         inherited_paths = _get_user_sw_search_paths(config.sw_progid, logger)
 
-        # ── Seed win32com early-binding cache for SolidWorks ─────────────────
-        # EnsureDispatch internally calls EnsureModule(typelib_clsid, ...).
-        # On many SolidWorks installations that call fails with
-        # "cannot automate the makepy process" because pywin32's default TLB
-        # lookup cannot resolve the registered path when it points into the SW
-        # EXE as a resource rather than a standalone .tlb file.
-        #
-        # _prepare_sw_makepy_cache() tries three methods:
-        #   A: ProgID → CLSID → TypeLib CLSID → gencache.EnsureModule
-        #   B: registry TLB path  → LoadTypeLib → EnsureModule
-        #   C: SW install dir scan → LoadTypeLib → EnsureModule
-        #   D: subprocess python -m win32com.client.makepy
-        # Methods no longer hard-fail; they log warnings and fall through to
-        # the EnsureDispatch / Dispatch fallback below.
-        _prepare_sw_makepy_cache(config.sw_progid, logger)
+        # ── Ensure early-binding cache is ready (hard-fail if not) ───────────
+        # CastTo(swModel, "IDrawingDoc") requires the makepy cache.
+        # If EnsureDispatch fails the operator must run makepy manually once.
+        _ensure_sw_early_binding(config.sw_progid, logger)
 
-        # Prefer early-binding (EnsureDispatch uses pre-seeded cache).
-        # If makepy cache is still missing, fall back to late-binding Dispatch —
-        # it loses CastTo(IDrawingDoc) but OpenDoc6 + property bag still work.
         logger.info("[Extractor] Connecting to SolidWorks COM…")
-        _early_bound = False
-        try:
-            swApp = win32com.client.gencache.EnsureDispatch(config.sw_progid)
-            logger.info("[Extractor] SolidWorks COM ready (early-bound)")
-            _early_bound = True
-        except Exception as ed:
-            logger.warning(f"[Extractor] EnsureDispatch failed ({ed}); trying late-binding Dispatch…")
-            swApp = win32com.client.Dispatch(config.sw_progid)
-            logger.info("[Extractor] SolidWorks COM ready (late-bound)")
+        swApp = win32com.client.gencache.EnsureDispatch(config.sw_progid)
+        logger.info("[Extractor] EnsureDispatch success")
         # Force full COM initialisation so IDrawingDoc interface is fully loaded.
         # Visible=True + UserControl=True + a brief delay ensures SolidWorks has
         # finished its own COM registration before we attempt OpenDoc.
@@ -777,15 +416,6 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
 
         logger.info(f"[Extractor] Document open OK in full mode (pass={pass_num})")
 
-        # ── Method E: seed makepy cache from the opened document object ───────
-        # Now that a fully-loaded COM object (swModel) is available, ask it for
-        # its own TypeLib via IDispatch.GetTypeInfo().  This is the most reliable
-        # path — the document object itself knows its interface definitions.
-        # On success EnsureDispatch becomes available for CastTo(IDrawingDoc).
-        if not _early_bound:
-            if _seed_makepy_from_com_object(swModel, logger):
-                _early_bound = True
-
         # ── Verify document type ───────────────────────────────────────────────
         # swDocumentTypes_e: 1=Part, 2=Assembly, 3=Drawing
         # In late-binding mode GetType may be a property (int) not a method —
@@ -802,69 +432,30 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         except Exception as e:
             logger.warning(f"[Extractor] GetType() skipped: {e} — assuming Drawing and continuing")
 
-        # ── Obtain IDrawingDoc IDispatch via QueryInterface ────────────────────
-        # The COM object returned by OpenDoc6 is typed as IModelDoc2.  Its
-        # IDispatch vtable only maps IModelDoc2 names; GetFirstView / GetNextView
-        # are on the separate IDrawingDoc vtable.
-        #
-        # Fix for v1.0.30:
-        #   QueryInterface MUST request IID_IDispatch as the second argument so
-        #   pywin32 receives a PyIDispatch it can wrap.  Single-arg QI returns
-        #   a raw PyIUnknown for unknown interfaces, which Dispatch() can't wrap
-        #   → "no interface object registered" error.
-        swDraw = None
-        if _sw_drawing_doc_iid is not None:
-            try:
-                qi_disp = swModel._oleobj_.QueryInterface(
-                    _sw_drawing_doc_iid,
-                    pythoncom.IID_IDispatch,      # <-- explicit: return as IDispatch
-                )
-                swDraw = win32com.client.Dispatch(qi_disp)
-                logger.info("[Extractor] QueryInterface: OK")
-            except Exception as e:
-                logger.warning(f"[Extractor] QI failed ({e}) — will try DISPID fallback")
-                swDraw = None
-
-        # ── DISPID fallback ────────────────────────────────────────────────────
-        # If QI returns the wrong pointer, InvokeTypes with the known DISPID
-        # still calls through the correct vtable offset on the COM object.
-        if swDraw is None and _sw_gfv_dispid is not None:
-            try:
-                raw = swModel._oleobj_.InvokeTypes(
-                    _sw_gfv_dispid,
-                    0,                              # lcid
-                    1,                              # DISPATCH_METHOD
-                    (pythoncom.VT_DISPATCH, 0),     # return type: IDispatch
-                    (),                             # no args
-                )
-                if raw is not None:
-                    # Use swModel as swDraw but patch GetFirstView via InvokeTypes
-                    swDraw = swModel
-                    logger.info("[Extractor] DISPID fallback: GetFirstView reachable via InvokeTypes")
-                else:
-                    logger.warning("[Extractor] DISPID fallback: InvokeTypes returned None")
-            except Exception as e:
-                logger.warning(f"[Extractor] DISPID fallback failed: {e}")
-
-        if swDraw is None:
-            swDraw = swModel
-            logger.warning(
-                "[Extractor] All IDrawingDoc strategies failed — using IModelDoc2 directly. "
-                "IDrawingDoc methods (GetFirstView etc.) will likely be inaccessible."
+        # ── Cast to IDrawingDoc via early-binding ──────────────────────────────
+        # EnsureDispatch (above) guarantees the makepy cache is present.
+        # CastTo uses the cached type info to obtain IDrawingDoc's own vtable,
+        # giving us IDrawingDoc's own vtable — the only way to call GetFirstView.
+        try:
+            swDraw = win32com.client.CastTo(swModel, "IDrawingDoc")
+            logger.info("[Extractor] CastTo IDrawingDoc: OK")
+        except Exception as e:
+            raise RuntimeError(
+                f"CastTo(swModel, 'IDrawingDoc') failed: {e}\n\n"
+                "The early-binding cache may be stale or incomplete. Run:\n"
+                f"    python -m win32com.client.makepy \"{config.sw_progid}\"\n"
+                "then restart the agent."
             )
 
-        # Confirm GetFirstView is accessible
+        # Verify GetFirstView is accessible on the early-bound IDrawingDoc object
         try:
-            gfv_fn = getattr(swDraw, "GetFirstView", None)
-            if gfv_fn is None or not callable(gfv_fn):
-                raise AttributeError("GetFirstView not in COM dispatch table")
-            _test_view = gfv_fn()
+            first_view = swDraw.GetFirstView()
             logger.info(
                 "[Extractor] GetFirstView: OK"
-                + (" (view returned)" if _test_view else " (None — sheet may not be active yet)")
+                + (" (view returned)" if first_view else " (None — may activate sheet first)")
             )
         except Exception as e:
-            raise RuntimeError(f"IDrawingDoc.GetFirstView not accessible: {e}")
+            raise RuntimeError(f"IDrawingDoc.GetFirstView failed: {e}")
 
         # ── Run modules ───────────────────────────────────────────────────────
         modules = [
