@@ -15,7 +15,7 @@ production
     step-by-step instructions.  No token is ever auto-generated.
 
 OTHER AUTO-FILLS (both modes)
-  api_url             → http://localhost:3000  (edit for production)
+  api_url             → current Replit Development URL (edit for production)
   node_id             → socket.gethostname()   (Windows machine name)
   solidworks_version  → highest version found in Windows registry (if set to 0)
 """
@@ -37,7 +37,7 @@ SW_VERSION_PROGID = {
 }
 
 _TOKEN_PLACEHOLDER = "REPLACE_WITH_YOUR_TOKEN"
-_DEFAULT_API_URL   = "https://thermopac-communication-thermopacllp.replit.app"
+_DEFAULT_API_URL   = "https://5d05ae61-8225-4651-bb76-b4e20a4ddabb-00-3mex6zlihlmft.janeway.replit.dev"
 
 
 class AgentConfig:

@@ -24,7 +24,7 @@ REM ─────────────────────────�
 
 setlocal enabledelayedexpansion
 
-set AGENT_VERSION=1.0.33
+set AGENT_VERSION=1.0.34
 set PY_VERSION=3.11.9
 set PY_ZIP=python-%PY_VERSION%-embed-amd64.zip
 set PY_URL=https://www.python.org/ftp/python/%PY_VERSION%/%PY_ZIP%
@@ -230,7 +230,7 @@ if not exist "%AGENT_DIST%\config.ini" (
         echo ; Edit before first run
         echo.
         echo [cloud]
-        echo api_url    = https://thermopac-communication-thermopacllp.replit.app
+        echo api_url    = https://5d05ae61-8225-4651-bb76-b4e20a4ddabb-00-3mex6zlihlmft.janeway.replit.dev
         echo node_id    = %COMPUTERNAME%
         echo node_token = REPLACE_WITH_YOUR_TOKEN
         echo.

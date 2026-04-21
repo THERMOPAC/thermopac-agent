@@ -27,14 +27,14 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ── Constants ────────────────────────────────────────────────────────────────
-$AGENT_VERSION   = "1.0.33"
+$AGENT_VERSION   = "1.0.34"
 $PY_VERSION      = "3.11.9"
 $PY_EMBED_ZIP    = "python-$PY_VERSION-embed-amd64.zip"
 $PY_EMBED_URL    = "https://www.python.org/ftp/python/$PY_VERSION/$PY_EMBED_ZIP"
 $GET_PIP_URL     = "https://bootstrap.pypa.io/get-pip.py"
 $PY_PTH_FILE     = "python311._pth"
 $REQUIRED_PKGS   = @("pywin32>=306", "requests>=2.31.0")
-$APP_URL         = "https://thermopac-communication-thermopacllp.replit.app"
+$APP_URL         = "https://5d05ae61-8225-4651-bb76-b4e20a4ddabb-00-3mex6zlihlmft.janeway.replit.dev"
 
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $SourceDir  = Split-Path -Parent $ScriptDir  # local-agent root
