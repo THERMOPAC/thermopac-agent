@@ -3,8 +3,9 @@ solidworks_extractor.py — Opens a dedicated SolidWorks instance and runs all
 10 extraction modules sequentially.
 
 Safety contract (from baseline v3):
-  - Always DispatchEx() — never attaches to user's running session
-  - swApp.Visible = False always
+  - v1.0.43 test mode attaches to a running SolidWorks session when present so
+    pre-opened referenced models can be detected and measured
+  - If no running session exists, COM starts SolidWorks normally
   - OpenDoc6 with ReadOnly | Silent flags
   - CloseDoc + ExitApp always in finally block
   - Never calls Save / SaveAs
@@ -32,6 +33,24 @@ def _connect_sw_application(progid: str, logger):
     makepy but still fail EnsureDispatch with "cannot automate the makepy
     process", so this must not block extraction.
     """
+    for pid in (progid, "SldWorks.Application"):
+        try:
+            active = win32com.client.GetActiveObject(pid)
+            sw_app = win32com.client.Dispatch(active)
+            logger.info(f"[COM] Binding mode: late (attached to running session via {pid})")
+            version = "unknown"
+            for attr in ("RevisionNumber", "Version"):
+                try:
+                    value = getattr(sw_app, attr)
+                    version = value() if callable(value) else value
+                    if version:
+                        break
+                except Exception:
+                    pass
+            logger.info(f"[COM] SolidWorks version detected: {version}")
+            return sw_app, "late-attached", True
+        except Exception:
+            pass
     try:
         sw_app = win32com.client.gencache.EnsureDispatch(progid)
         binding_mode = "early"
@@ -52,7 +71,7 @@ def _connect_sw_application(progid: str, logger):
         except Exception:
             pass
     logger.info(f"[COM] SolidWorks version detected: {version}")
-    return sw_app, binding_mode
+    return sw_app, binding_mode, False
 
 try:
     import win32gui
@@ -234,6 +253,175 @@ def _log_reference_diagnostics(swApp, temp_path: str, logger, stage: str) -> dic
         except Exception as e:
             logger.info(f"[Extractor] Reference diagnostics {label} failed: {type(e).__name__}: {e}")
     return out
+
+
+def _norm_path(path: str) -> str:
+    try:
+        return os.path.normcase(os.path.abspath(str(path or "").strip().strip('"')))
+    except Exception:
+        return str(path or "").strip().lower()
+
+
+def _safe_model_path(model) -> str:
+    if model is None:
+        return ""
+    for name in ("GetPathName", "PathName"):
+        try:
+            value = getattr(model, name, None)
+            if value is None:
+                continue
+            path = value() if callable(value) else value
+            if path:
+                return str(path)
+        except Exception:
+            pass
+    return ""
+
+
+def _safe_model_title(model) -> str:
+    if model is None:
+        return ""
+    for name in ("GetTitle", "Title"):
+        try:
+            value = getattr(model, name, None)
+            if value is None:
+                continue
+            title = value() if callable(value) else value
+            if title:
+                return str(title)
+        except Exception:
+            pass
+    return ""
+
+
+def _iter_open_documents(swApp, logger) -> list[dict]:
+    docs: list[dict] = []
+    seen = set()
+    try:
+        doc = swApp.GetFirstDocument()
+    except Exception as e:
+        logger.info(f"[Extractor] Open-document inventory unavailable: {type(e).__name__}: {e}")
+        return docs
+    while doc is not None:
+        try:
+            path = _safe_model_path(doc)
+            title = _safe_model_title(doc)
+            doc_type, doc_type_name = _safe_doc_type(doc)
+            key = _norm_path(path) if path else f"title:{title.lower()}"
+            if key and key not in seen:
+                docs.append({
+                    "path": path,
+                    "title": title,
+                    "doc_type": doc_type,
+                    "doc_type_name": doc_type_name,
+                })
+                seen.add(key)
+        except Exception as e:
+            logger.info(f"[Extractor] Open-document inventory item skipped: {type(e).__name__}: {e}")
+        try:
+            next_doc = getattr(doc, "GetNext", None)
+            doc = next_doc() if callable(next_doc) else next_doc
+        except Exception:
+            break
+    return docs
+
+
+def _detect_preopened_dependencies(swApp, reference_diagnostics: dict, logger) -> dict:
+    dep_paths = []
+    seen_deps = set()
+    for path_value in (reference_diagnostics or {}).get("path_entries", []) or []:
+        text = str(path_value or "")
+        if not text:
+            continue
+        lower = text.lower()
+        if not lower.endswith((".sldprt", ".sldasm")):
+            continue
+        key = _norm_path(text)
+        if key not in seen_deps:
+            dep_paths.append(text)
+            seen_deps.add(key)
+
+    open_docs = _iter_open_documents(swApp, logger)
+    by_path = {_norm_path(d.get("path", "")): d for d in open_docs if d.get("path")}
+    by_title = {}
+    for doc in open_docs:
+        title = (doc.get("title") or os.path.basename(doc.get("path", "")) or "").lower()
+        if title:
+            by_title[title] = doc
+
+    already_open = []
+    closed = []
+    for dep_path in dep_paths:
+        dep_key = _norm_path(dep_path)
+        dep_base = os.path.basename(dep_path).lower()
+        matched = by_path.get(dep_key) or by_title.get(dep_base)
+        if matched is None:
+            try:
+                opened = swApp.GetOpenDocumentByName(dep_path)
+                if opened is None and dep_base:
+                    opened = swApp.GetOpenDocumentByName(os.path.basename(dep_path))
+                if opened is not None:
+                    matched = {
+                        "path": _safe_model_path(opened),
+                        "title": _safe_model_title(opened),
+                        "doc_type": _safe_doc_type(opened)[0],
+                        "doc_type_name": _safe_doc_type(opened)[1],
+                    }
+            except Exception:
+                pass
+        if matched is not None:
+            already_open.append({
+                "dependency_path": dep_path,
+                "open_doc_path": matched.get("path", ""),
+                "open_doc_title": matched.get("title", ""),
+                "open_doc_type": matched.get("doc_type_name", ""),
+            })
+        else:
+            closed.append(dep_path)
+
+    diagnostics = {
+        "total_dependencies": len(dep_paths),
+        "already_open_count": len(already_open),
+        "closed_count": len(closed),
+        "already_open": already_open,
+        "closed_sample": closed[:25],
+        "open_documents_total": len(open_docs),
+        "open_documents_sample": open_docs[:25],
+    }
+    logger.info(
+        f"[Extractor] Pre-open dependency inventory: total_dependencies={diagnostics['total_dependencies']} "
+        f"already_open={diagnostics['already_open_count']} closed={diagnostics['closed_count']} "
+        f"open_documents_in_session={diagnostics['open_documents_total']}"
+    )
+    for item in already_open[:30]:
+        logger.info(
+            f"[Extractor] Dependency already open: dependency='{item['dependency_path']}' "
+            f"open_doc='{item['open_doc_path'] or item['open_doc_title']}' type={item['open_doc_type']}"
+        )
+    if len(already_open) > 30:
+        logger.info(f"[Extractor] Dependency already-open list truncated: {len(already_open) - 30} more")
+    return diagnostics
+
+
+def _summarize_extraction_result(result: dict) -> dict:
+    views = result.get("views") or []
+    dimensions = result.get("dimensions") or {}
+    annotations = result.get("annotations") or {}
+    tables = result.get("tables") or {}
+    design_data = result.get("design_data") or {}
+    model_refs = [v.get("model_reference") for v in views if isinstance(v, dict) and v.get("model_reference")]
+    summary = {
+        "views_total": len(views),
+        "model_reference_populated_count": len(model_refs),
+        "model_reference_unique_count": len(set(model_refs)),
+        "dimensions_total_count": int(dimensions.get("total_count") or 0),
+        "annotations_total_seen": int(annotations.get("total_annotations_seen") or 0),
+        "bom_found": bool(tables.get("bom_found")),
+        "bom_rows": int(tables.get("bom_rows") or 0),
+        "design_data_status": design_data.get("status", ""),
+        "design_data_source": design_data.get("source", ""),
+    }
+    return summary
 
 
 def _set_doc_spec_attr(docSpec, names: tuple[str, ...], value, logger) -> str:
@@ -472,7 +660,7 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         # ── COM initialisation (must be called in each thread) ─────────────────
         pythoncom.CoInitialize()
 
-        # ── Launch dedicated SW instance ───────────────────────────────────────
+        # ── Connect to SolidWorks ──────────────────────────────────────────────
         _check_cancel(cancel_event, "before SW launch")
         logger.info(f"[Extractor] Launching SolidWorks ({config.sw_progid})…")
         t_launch = time.monotonic()
@@ -480,7 +668,7 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         inherited_paths = _get_user_sw_search_paths(config.sw_progid, logger)
 
         logger.info("[Extractor] Connecting to SolidWorks COM…")
-        swApp, binding_mode = _connect_sw_application(config.sw_progid, logger)
+        swApp, binding_mode, attached_existing_session = _connect_sw_application(config.sw_progid, logger)
         # Force full COM initialisation so IDrawingDoc interface is fully loaded.
         # Visible=True + UserControl=True + a brief delay ensures SolidWorks has
         # finished its own COM registration before we attempt OpenDoc.
@@ -534,11 +722,22 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         err_val  = 0
         warn_val = 0
 
+        reference_diagnostics = _log_reference_diagnostics(swApp, temp_path, logger, "before-open")
+        preopen_diagnostics = _detect_preopened_dependencies(swApp, reference_diagnostics, logger)
+
         open_diagnostics = {
             "file_size_bytes": file_size,
             "open_pass": "",
             "open_mode": "",
-            "reference_diagnostics": _log_reference_diagnostics(swApp, temp_path, logger, "before-open"),
+            "solidworks_session": "attached_existing" if attached_existing_session else "created_or_reused_by_com",
+            "reference_diagnostics": reference_diagnostics,
+            "preopened_dependencies": preopen_diagnostics,
+            "open_mode_influence": {
+                "preopened_dependencies_present": preopen_diagnostics["already_open_count"] > 0,
+                "candidate_full_resolved_open_first": True,
+                "open_sequence_changed_before_open": False,
+                "reason": "Full resolved open is always attempted first; this test records whether already-open references make that pass succeed before fallbacks.",
+            },
         }
 
         def _close_zombie(label: str):
@@ -693,6 +892,14 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
 
         logger.info(f"[Extractor] Document open OK (pass={pass_num})")
         open_diagnostics["open_pass"] = str(pass_num)
+        open_diagnostics["open_mode_influence"]["full_resolved_open_succeeded"] = str(pass_num) == "pass 0 full-silent"
+        open_diagnostics["open_mode_influence"]["observed_richer_open_with_preopened_dependencies"] = (
+            preopen_diagnostics["already_open_count"] > 0 and str(pass_num) == "pass 0 full-silent"
+        )
+        logger.info(
+            f"[Extractor] Pre-open influence after drawing open: preopened_dependencies={preopen_diagnostics['already_open_count']} "
+            f"open_pass='{pass_num}' full_resolved_open_succeeded={str(pass_num) == 'pass 0 full-silent'}"
+        )
         result["open_diagnostics"] = open_diagnostics
 
         # ── Verify document type ───────────────────────────────────────────────
@@ -764,6 +971,17 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
             if warning not in result["extraction_warnings"]:
                 result["extraction_warnings"].append(warning)
 
+        result["extraction_summary"] = _summarize_extraction_result(result)
+        result["open_diagnostics"]["post_open_extraction_summary"] = result["extraction_summary"]
+        logger.info(
+            "[Extractor] Post-open extraction summary: "
+            f"model_refs={result['extraction_summary']['model_reference_populated_count']}/{result['extraction_summary']['views_total']} "
+            f"dims={result['extraction_summary']['dimensions_total_count']} "
+            f"annotations={result['extraction_summary']['annotations_total_seen']} "
+            f"bom_found={result['extraction_summary']['bom_found']} "
+            f"design_data={result['extraction_summary']['design_data_status']}:{result['extraction_summary']['design_data_source']}"
+        )
+
         logger.info("[Extractor] All modules complete")
         return result
 
@@ -775,12 +993,14 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                 logger.info("[Extractor] Document closed")
             except Exception as e:
                 logger.warning(f"[Extractor] CloseDoc error: {e}")
-        if swApp is not None:
+        if swApp is not None and not locals().get("attached_existing_session", False):
             try:
                 swApp.ExitApp()
                 logger.info("[Extractor] SolidWorks instance exited")
             except Exception as e:
                 logger.warning(f"[Extractor] ExitApp error: {e}")
+        elif swApp is not None:
+            logger.info("[Extractor] Attached SolidWorks session left running")
         try:
             pythoncom.CoUninitialize()
         except Exception:
