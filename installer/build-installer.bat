@@ -12,7 +12,7 @@ REM   5. Runs pywin32 post-install to register COM DLLs
 REM   6. Generates SolidWorks COM type library cache (makepy) — three methods
 REM   7. Copies agent sources into dist\ThermopacAgent\
 REM   8. Copies run.bat / run-service.bat / makepy-repair.bat
-REM   9. (Optional) Compiles setup.iss into ThermopacAgent-Setup-v1.0.19.exe
+REM   9. (Optional) Compiles setup.iss into ThermopacAgent-Setup-v%AGENT_VERSION%.exe
 REM         if Inno Setup 6 is detected on the build machine
 REM
 REM Prerequisites (build machine):
@@ -24,7 +24,7 @@ REM ─────────────────────────�
 
 setlocal enabledelayedexpansion
 
-set AGENT_VERSION=1.0.19
+set AGENT_VERSION=1.0.33
 set PY_VERSION=3.11.9
 set PY_ZIP=python-%PY_VERSION%-embed-amd64.zip
 set PY_URL=https://www.python.org/ftp/python/%PY_VERSION%/%PY_ZIP%

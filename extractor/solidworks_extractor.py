@@ -71,7 +71,7 @@ from extractor.extract_tables        import ExtractTables
 from extractor.extract_references    import ExtractReferences
 from extractor.extract_health        import ExtractHealth
 from extractor.extract_nozzles       import ExtractNozzles
-from extractor.extract_design_data   import ExtractDesignDataTable, DesignDataNotFoundError
+from extractor.extract_design_data   import ExtractDesignDataTable
 
 # SolidWorks constants  (swOpenDocOptions_e)
 SW_DOC_DRAWING           = 3
@@ -196,7 +196,7 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
     """
     Main entry point called by job_runner in a worker thread.
     Returns the full extraction result dict (without agent metadata — runner stamps that).
-    Raises on hard failure (DesignDataNotFoundError, SW launch failure, etc.).
+    Raises on SolidWorks launch/open failures. Extraction modules are best-effort.
     """
     if not PYWIN32_AVAILABLE:
         raise RuntimeError(
@@ -228,7 +228,9 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         "references":         {},
         "health":             {},
         "nozzles":            {},
+        "design_data":        {},
         "design_data_table":  {},
+        "extraction_warnings": [],
         "extraction_errors": {
             "properties":        None,
             "sheets":            None,
@@ -438,6 +440,7 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
                 err_msg = f"{type(e).__name__}: {e}"
                 logger.warning(f"[Extractor] API call failed: CastTo(IDrawingDoc): {err_msg}; continuing best-effort")
                 result["extraction_errors"]["CastTo(IDrawingDoc)"] = err_msg
+                result["extraction_warnings"].append(f"CastTo(IDrawingDoc) unavailable: {err_msg}")
         else:
             logger.info("[Extractor] Late binding active — using opened model object for best-effort drawing extraction")
 
@@ -451,6 +454,7 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
             err_msg = f"{type(e).__name__}: {e}"
             logger.warning(f"[Extractor] API call failed: IDrawingDoc.GetFirstView: {err_msg}; continuing best-effort")
             result["extraction_errors"]["IDrawingDoc.GetFirstView"] = err_msg
+            result["extraction_warnings"].append(f"IDrawingDoc.GetFirstView unavailable: {err_msg}")
 
         # ── Run modules ───────────────────────────────────────────────────────
         modules = [
@@ -473,13 +477,20 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
             try:
                 result[key] = fn()
                 logger.debug(f"[Extractor] {key} OK ({time.monotonic() - t0:.2f}s)")
-            except DesignDataNotFoundError:
-                # Hard failure — re-raise to caller
-                raise
             except Exception as e:
                 err_msg = f"{type(e).__name__}: {e}"
                 logger.error(f"[Extractor] {key} SOFT FAIL: {err_msg}")
                 result["extraction_errors"][key] = err_msg
+                result["extraction_warnings"].append(f"{key} extraction failed: {err_msg}")
+
+        ddt = result.get("design_data_table") or {}
+        result["design_data"] = {
+            "status": ddt.get("status", "missing" if not ddt.get("found") else "found"),
+            "source": ddt.get("source", "missing"),
+        }
+        for warning in ddt.get("warnings", []) or []:
+            if warning not in result["extraction_warnings"]:
+                result["extraction_warnings"].append(warning)
 
         logger.info("[Extractor] All modules complete")
         return result
