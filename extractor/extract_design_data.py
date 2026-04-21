@@ -20,6 +20,8 @@ Candidate scoring:
 """
 
 from __future__ import annotations
+import html
+import re
 from extractor._com_helper import get_com_value, sw_call, to_list, activate_sheet_and_get_current_sheet, iter_drawing_views
 
 try:
@@ -29,6 +31,12 @@ except Exception:
 
 SW_TABLE_ANNOTATION_GENERAL_TYPES  = {0, 11}
 SW_TABLE_ANNOTATION_BOM_TYPES      = {2}
+
+MECHANICAL_DDS_TITLE_PREFIX = "DESIGN DATA SHEET"
+GENERAL_DATA_TITLE = "GENERAL DATA"
+METADATA_TITLE = "METADATA"
+MECHANICAL_DDS_HEADERS = ["GROUP", "PARAMETER", "SHELL", "TUBE", "JACKET"]
+FIELD_VALUE_HEADERS = ["FIELD", "VALUE"]
 
 _DDS_FIELD_SIGNATURES = [
     "internal design pressure",
@@ -114,53 +122,274 @@ class DesignDataNotFoundError(Exception):
 
 
 def ExtractDesignDataTable(swApp, swModel, swDraw, logger) -> dict:
-    warnings = []
-    table_result = _find_design_data_table(swApp, swDraw, logger)
-    if table_result.get("rows"):
-        rows = table_result["rows"]
-        logger.info(f"[DesignData] Found {len(rows)} row(s) from table")
-        return {
-            "found": True,
-            "status": "found",
-            "source": "table",
-            "rows": rows,
-            "table_titles_found": table_result.get("table_titles_found", []),
-            "raw_tables": table_result.get("raw_tables", []),
-            "fallback_text": [],
-            "warnings": table_result.get("warnings", []),
-        }
+    strict_result = _extract_strict_dds_blocks(swApp, swDraw, logger)
+    blocks = strict_result["dds_blocks"]
+    found = any(block.get("found") for block in blocks.values())
+    valid = any(block.get("status") == "valid" for block in blocks.values())
+    if valid:
+        logger.info("[DesignData] Strict DDS block extraction found valid table block(s)")
+    elif found:
+        logger.warning("[DesignData] Strict DDS block extraction found section(s), but header validation failed")
+    else:
+        logger.warning("[DesignData] Strict DDS block extraction found no matching DDS sections")
+    return {
+        "found": found,
+        "status": "table" if found else "missing",
+        "source": "table" if found else "missing",
+        "rows": [],
+        "dds_blocks": blocks,
+        "table_titles_found": strict_result.get("table_titles_found", []),
+        "raw_tables": strict_result.get("raw_tables", []),
+        "fallback_text": [],
+        "warnings": strict_result.get("warnings", []),
+    }
 
-    warnings.extend(table_result.get("warnings", []))
-    notes_result = _find_design_data_notes(swApp, swModel, swDraw, logger)
-    warnings.extend(notes_result.get("warnings", []))
-    if notes_result.get("accepted_text"):
-        logger.warning("[DesignData] Structured Design Data table missing; accepted likely Design Data note/text fallback")
-        return {
-            "found": False,
-            "status": "found",
-            "source": "notes",
-            "rows": [],
-            "table_titles_found": table_result.get("table_titles_found", []),
-            "raw_tables": table_result.get("raw_tables", []),
-            "fallback_text": notes_result["accepted_text"],
-            "note_candidates": notes_result.get("candidates", []),
-            "warnings": warnings,
-        }
 
-    warning = "Design Data table not found or inaccessible; continuing with design_data.status=missing"
-    logger.warning(f"[DesignData] {warning}")
-    warnings.append(warning)
+def _strip_cell_markup(value) -> str:
+    text = "" if value is None else str(value)
+    text = html.unescape(text).replace("\xa0", " ")
+    text = re.sub(r"<[^>]*>", "", text)
+    return text.strip()
+
+
+def _match_text(value: str) -> str:
+    return re.sub(r"\s+", " ", _strip_cell_markup(value)).strip().upper()
+
+
+def _empty_dds_block(expected_headers: list[str], status: str = "missing") -> dict:
     return {
         "found": False,
-        "status": "missing",
-        "source": "missing",
+        "header_match": False,
+        "status": status,
+        "missing_headers": list(expected_headers),
+        "row_count": 0,
+        "headers": [],
         "rows": [],
-        "table_titles_found": table_result.get("table_titles_found", []),
-        "raw_tables": table_result.get("raw_tables", []),
-        "fallback_text": [],
-        "note_candidates": notes_result.get("candidates", []),
-        "warnings": warnings,
+        "title": "",
     }
+
+
+def _title_candidates(table_title: str, rows: list[list[str]]) -> list[dict]:
+    candidates = []
+    if table_title:
+        candidates.append({"title": table_title, "source": "table_title", "row_index": None})
+    for idx, row in enumerate(rows[:5]):
+        joined = " ".join(cell for cell in row if cell).strip()
+        if joined:
+            candidates.append({"title": joined, "source": "row", "row_index": idx})
+    return candidates
+
+
+def _locate_header_sequence(rows: list[list[str]], expected_headers: list[str]) -> tuple[int | None, int | None, list[str]]:
+    expected_norm = [_match_text(header) for header in expected_headers]
+    for row_index, row in enumerate(rows):
+        row_norm = [_match_text(cell) for cell in row]
+        max_start = max(0, len(row_norm) - len(expected_norm) + 1)
+        for start in range(max_start):
+            segment = row_norm[start:start + len(expected_norm)]
+            if segment == expected_norm:
+                return row_index, start, row[start:start + len(expected_norm)]
+    return None, None, []
+
+
+def _missing_headers(rows: list[list[str]], expected_headers: list[str]) -> list[str]:
+    available = {_match_text(cell) for row in rows for cell in row if cell}
+    return [header for header in expected_headers if _match_text(header) not in available]
+
+
+def _rows_after_header(rows: list[list[str]], header_index: int, start_col: int, width: int) -> list[list[str]]:
+    parsed = []
+    for row in rows[header_index + 1:]:
+        cells = row[start_col:start_col + width]
+        if len(cells) < width:
+            cells = cells + [""] * (width - len(cells))
+        if any(cell != "" for cell in cells):
+            parsed.append(cells)
+    return parsed
+
+
+def _build_block(rows: list[list[str]], expected_headers: list[str], title: str, found: bool) -> dict:
+    header_index, start_col, headers = _locate_header_sequence(rows, expected_headers)
+    header_match = header_index is not None and start_col is not None
+    if not found:
+        return _empty_dds_block(expected_headers)
+    if not header_match:
+        block = _empty_dds_block(expected_headers, status="invalid")
+        block["found"] = True
+        block["title"] = title
+        block["missing_headers"] = _missing_headers(rows, expected_headers)
+        return block
+    parsed_rows = _rows_after_header(rows, header_index, start_col, len(expected_headers))
+    return {
+        "found": True,
+        "header_match": True,
+        "status": "valid",
+        "missing_headers": [],
+        "row_count": len(parsed_rows),
+        "headers": headers,
+        "rows": parsed_rows,
+        "title": title,
+    }
+
+
+def _evaluate_table_for_strict_blocks(table_rows: list[list[str]], table_title: str, blocks: dict) -> None:
+    candidates = _title_candidates(table_title, table_rows)
+    title_texts = [(candidate["title"], _match_text(candidate["title"])) for candidate in candidates]
+
+    mechanical_title = next((title for title, norm in title_texts if norm.startswith(MECHANICAL_DDS_TITLE_PREFIX)), "")
+    if mechanical_title and not blocks["mechanical_design_data"].get("found"):
+        blocks["mechanical_design_data"] = _build_block(
+            table_rows,
+            MECHANICAL_DDS_HEADERS,
+            mechanical_title,
+            found=True,
+        )
+
+    general_title = next((title for title, norm in title_texts if norm == GENERAL_DATA_TITLE), "")
+    if general_title and not blocks["general_data"].get("found"):
+        blocks["general_data"] = _build_block(
+            table_rows,
+            FIELD_VALUE_HEADERS,
+            general_title,
+            found=True,
+        )
+
+    metadata_title = next((title for title, norm in title_texts if norm == METADATA_TITLE), "")
+    if metadata_title and not blocks["metadata"].get("found"):
+        blocks["metadata"] = _build_block(
+            table_rows,
+            FIELD_VALUE_HEADERS,
+            metadata_title,
+            found=True,
+        )
+
+
+def _read_strict_table_raw(table_ann) -> list[list[str]]:
+    rows = []
+    try:
+        row_count = table_ann.RowCount
+        col_count = table_ann.ColumnCount
+    except Exception:
+        return rows
+    for r in range(row_count):
+        row = []
+        for c in range(col_count):
+            try:
+                row.append(_strip_cell_markup(_cell_text(table_ann, r, c)))
+            except Exception:
+                row.append("")
+        rows.append(row)
+    return rows
+
+
+def _scan_strict_table(table_ann, label: str, blocks: dict, titles_found: list, raw_tables: list, logger) -> None:
+    try:
+        t_type = table_ann.Type
+    except Exception:
+        t_type = -1
+    try:
+        title = _strip_cell_markup(table_ann.Title or "")
+    except Exception:
+        title = ""
+    try:
+        nrows, ncols = table_ann.RowCount, table_ann.ColumnCount
+    except Exception:
+        nrows = ncols = "?"
+    rows = _read_strict_table_raw(table_ann)
+    candidates = _title_candidates(title, rows)
+    titles_found.append({
+        "label": label,
+        "type": t_type,
+        "rows": nrows,
+        "cols": ncols,
+        "title": title,
+        "title_candidates": [candidate["title"] for candidate in candidates],
+    })
+    raw_tables.append({"label": label, "type": t_type, "rows": nrows, "cols": ncols, "title": title, "content": rows})
+    logger.info(f"[DesignData] Strict scan [{label}] title='{title}' type={t_type} size={nrows}x{ncols}")
+    _evaluate_table_for_strict_blocks(rows, title, blocks)
+
+
+def _extract_strict_dds_blocks(swApp, swDraw, logger) -> dict:
+    blocks = {
+        "mechanical_design_data": _empty_dds_block(MECHANICAL_DDS_HEADERS),
+        "general_data": _empty_dds_block(FIELD_VALUE_HEADERS),
+        "metadata": _empty_dds_block(FIELD_VALUE_HEADERS),
+    }
+    titles_found = []
+    raw_tables = []
+    warnings = []
+
+    def done() -> bool:
+        return all(block.get("found") for block in blocks.values())
+
+    try:
+        sheet_names = to_list(sw_call(swDraw, "GetSheetNames"))
+    except Exception as e:
+        sheet_names = []
+        warnings.append(f"GetSheetNames failed: {e}")
+
+    try:
+        swSheet = sw_call(swDraw, "GetCurrentSheet")
+        if swSheet is not None:
+            table_anns = to_list(sw_call(swSheet, "GetTableAnnotations"))
+            for i, ta in enumerate(table_anns or []):
+                _scan_strict_table(ta, f"A/current_sheet/t{i}", blocks, titles_found, raw_tables, logger)
+                if done():
+                    return {"dds_blocks": blocks, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
+    except Exception as e:
+        warnings.append(f"Current sheet strict table scan failed: {e}")
+
+    try:
+        swView = sw_call(swDraw, "GetFirstView")
+        view_num = 0
+        while swView is not None and view_num < 50:
+            try:
+                table_anns = []
+                for method in ("GetTableAnnotations", "TableAnnotations"):
+                    try:
+                        table_anns = to_list(sw_call(swView, method))
+                        if table_anns:
+                            break
+                    except Exception:
+                        pass
+                for i, ta in enumerate(table_anns or []):
+                    _scan_strict_table(ta, f"B/v{view_num}/t{i}", blocks, titles_found, raw_tables, logger)
+                    if done():
+                        return {"dds_blocks": blocks, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
+            except Exception as e:
+                warnings.append(f"View {view_num} strict table scan failed: {e}")
+            view_num += 1
+            try:
+                swView = sw_call(swView, "GetNextView")
+            except Exception:
+                break
+    except Exception as e:
+        warnings.append(f"GetFirstView strict table scan failed: {e}")
+
+    for sname in (sheet_names or []):
+        try:
+            swDraw, swSheet = activate_sheet_and_get_current_sheet(swApp, swDraw, sname, logger)
+            if swSheet is not None:
+                table_anns = to_list(sw_call(swSheet, "GetTableAnnotations"))
+                for i, ta in enumerate(table_anns or []):
+                    _scan_strict_table(ta, f"C/{sname}/t{i}", blocks, titles_found, raw_tables, logger)
+                    if done():
+                        return {"dds_blocks": blocks, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
+        except Exception as e:
+            warnings.append(f"Sheet '{sname}' strict table scan failed: {e}")
+
+    for vnum, (_, view) in enumerate(iter_drawing_views(swDraw, sheet_names)):
+        try:
+            table_anns = to_list(sw_call(view, "GetTableAnnotations"))
+            for i, ta in enumerate(table_anns or []):
+                _scan_strict_table(ta, f"D/GetViews/v{vnum}/t{i}", blocks, titles_found, raw_tables, logger)
+                if done():
+                    return {"dds_blocks": blocks, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
+        except Exception as e:
+            warnings.append(f"GetViews view {vnum} strict table scan failed: {e}")
+
+    return {"dds_blocks": blocks, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
 
 
 def _score_dds_candidate(table_ann, logger) -> int:
