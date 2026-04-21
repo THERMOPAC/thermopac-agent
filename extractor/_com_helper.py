@@ -14,6 +14,11 @@ sw_call() handles both modes transparently.
 from __future__ import annotations
 from typing import Any
 
+try:
+    import win32com.client
+except Exception:
+    win32com = None
+
 
 def sw_call(obj: Any, method: str, *args: Any) -> Any:
     """
@@ -62,3 +67,102 @@ def to_list(val: Any) -> list:
     if hasattr(val, "__iter__"):
         return list(val)
     return [val]
+
+
+def cast_to_drawing_doc(obj: Any) -> Any:
+    if obj is None or win32com is None:
+        return obj
+    for cast_name in ("DrawingDoc", "IDrawingDoc"):
+        try:
+            return win32com.client.CastTo(obj, cast_name)
+        except Exception:
+            pass
+    return obj
+
+
+def get_active_doc(swApp: Any) -> Any:
+    for method in ("ActiveDoc", "IActiveDoc2"):
+        try:
+            value = getattr(swApp, method, None)
+            if value is None:
+                continue
+            doc = value() if callable(value) else value
+            if doc is not None:
+                return doc
+        except Exception:
+            pass
+    return None
+
+
+def refetch_active_drawing_doc(swApp: Any, fallback: Any = None) -> Any:
+    active = get_active_doc(swApp)
+    if active is not None:
+        return cast_to_drawing_doc(active)
+    return cast_to_drawing_doc(fallback)
+
+
+def activate_sheet_and_get_current_sheet(swApp: Any, swDraw: Any, sheet_name: str, logger: Any = None) -> tuple[Any, Any]:
+    sw_call(swDraw, "ActivateSheet", sheet_name)
+    active_draw = refetch_active_drawing_doc(swApp, swDraw)
+    for candidate in (active_draw, swDraw):
+        try:
+            swSheet = sw_call(candidate, "GetCurrentSheet")
+            if swSheet is not None:
+                return candidate, swSheet
+        except Exception as e:
+            if logger is not None:
+                logger.debug(f"[COM] GetCurrentSheet after ActivateSheet('{sheet_name}') failed on {type(candidate).__name__}: {e}")
+    return active_draw, None
+
+
+def com_type_summary(obj: Any) -> dict:
+    summary = {
+        "python_type": type(obj).__name__ if obj is not None else "None",
+        "python_module": type(obj).__module__ if obj is not None else "",
+        "repr": repr(obj)[:240] if obj is not None else "None",
+        "typeinfo_name": "",
+        "typeinfo_doc": "",
+        "typeattr_guid": "",
+    }
+    try:
+        ole = getattr(obj, "_oleobj_", None)
+        if ole is not None:
+            ti = ole.GetTypeInfo()
+            if ti is not None:
+                try:
+                    doc = ti.GetDocumentation(-1)
+                    summary["typeinfo_name"] = str(doc[0] or "")
+                    summary["typeinfo_doc"] = str(doc[1] or "")
+                except Exception:
+                    pass
+                try:
+                    attr = ti.GetTypeAttr()
+                    summary["typeattr_guid"] = str(attr[0])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return summary
+
+
+def probe_method(obj: Any, method: str, *args: Any) -> dict:
+    info = {
+        "method": method,
+        "has_attr": False,
+        "callable": False,
+        "call_ok": False,
+        "result_type": "",
+        "result_preview": "",
+        "error": "",
+    }
+    try:
+        attr = getattr(obj, method)
+        info["has_attr"] = True
+        info["callable"] = callable(attr)
+        value = attr(*args) if callable(attr) else attr
+        info["call_ok"] = True
+        info["result_type"] = type(value).__name__
+        info["result_preview"] = repr(value)[:180]
+    except Exception as e:
+        info["error"] = f"{type(e).__name__}: {e}"
+    return info

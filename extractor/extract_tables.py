@@ -5,7 +5,7 @@ Soft failure.
 """
 
 from __future__ import annotations
-from extractor._com_helper import sw_call, to_list
+from extractor._com_helper import sw_call, to_list, activate_sheet_and_get_current_sheet
 
 SW_TABLE_BOM       = 0
 SW_TABLE_GENERAL   = 11
@@ -27,8 +27,7 @@ def ExtractTables(swApp, swModel, swDraw, logger) -> dict:
 
         for sheet_name in sheet_names:
             try:
-                sw_call(swDraw, "ActivateSheet", sheet_name)
-                swSheet = sw_call(swDraw, "GetCurrentSheet")
+                swDraw, swSheet = activate_sheet_and_get_current_sheet(swApp, swDraw, sheet_name, logger)
                 if swSheet is None:
                     continue
                 table_anns = to_list(sw_call(swSheet, "GetTableAnnotations"))

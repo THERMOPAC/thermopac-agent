@@ -18,8 +18,8 @@
     powershell -ExecutionPolicy Bypass -File setup.ps1 -Silent
 #>
 param(
-    [string]$InstallDir  = "C:\Program Files\ThermopacAgent",
-    [string]$DataDir     = "C:\ThermopacAgent",
+    [string]$InstallDir  = "C:\Program Files\ThermopacAgentDev",
+    [string]$DataDir     = "C:\ThermopacAgentDev",
     [switch]$Silent
 )
 
@@ -27,7 +27,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ── Constants ────────────────────────────────────────────────────────────────
-$AGENT_VERSION   = "1.0.35"
+$AGENT_VERSION   = "1.0.37"
 $PY_VERSION      = "3.11.9"
 $PY_EMBED_ZIP    = "python-$PY_VERSION-embed-amd64.zip"
 $PY_EMBED_URL    = "https://www.python.org/ftp/python/$PY_VERSION/$PY_EMBED_ZIP"

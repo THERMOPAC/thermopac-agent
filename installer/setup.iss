@@ -10,8 +10,8 @@
 ;   - dist\ThermopacAgent\  folder built by build-installer.bat
 ;   - dist\python\          Python 3.11 embeddable (downloaded by build-installer.bat)
 
-#define AppName      "ThermopacAgent"
-#define AppVersion   "1.0.35"
+#define AppName      "ThermopacAgent Dev"
+#define AppVersion   "1.0.37"
 #define AppPublisher "Thermopac"
 #define AppURL       "https://5d05ae61-8225-4651-bb76-b4e20a4ddabb-00-3mex6zlihlmft.janeway.replit.dev"
 #define AppExeName   "run.bat"
@@ -24,12 +24,12 @@
 #define PythonDir    AgentRoot + "\dist\python"
 
 [Setup]
-AppId={{7B4A1C2D-E3F5-4A6B-8C9D-0E1F2A3B4C5D}
+AppId={{B06B4460-8C38-4705-97DC-71E9C1E5D936}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
 AppPublisherURL={#AppURL}
-DefaultDirName={autopf}\{#AppName}
+DefaultDirName={autopf}\ThermopacAgentDev
 DefaultGroupName={#AppName}
 AllowNoIcons=yes
 OutputDir={#AgentRoot}\installer_output
@@ -67,9 +67,9 @@ Source: "{#SourcePath}setup.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#AgentRoot}\config.ini"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
 
 [Dirs]
-Name: "{commonappdata}\ThermopacAgent\temp";   Permissions: everyone-full
-Name: "{commonappdata}\ThermopacAgent\logs";   Permissions: everyone-full
-Name: "{commonappdata}\ThermopacAgent\config"; Permissions: everyone-full
+Name: "{commonappdata}\ThermopacAgentDev\temp";   Permissions: everyone-full
+Name: "{commonappdata}\ThermopacAgentDev\logs";   Permissions: everyone-full
+Name: "{commonappdata}\ThermopacAgentDev\config"; Permissions: everyone-full
 
 [Icons]
 Name: "{group}\{#AppName}";             Filename: "{app}\run.bat";       WorkingDir: "{app}"
@@ -146,11 +146,11 @@ begin
   if IsTaskSelected('startupschedule') then
   begin
     Exec('schtasks.exe',
-      '/Create /F /SC ONLOGON /RL HIGHEST /TN "ThermopacAgent" /TR "\"' +
+      '/Create /F /SC ONLOGON /RL HIGHEST /TN "ThermopacAgentDev" /TR "\"' +
       ExpandConstant('{app}') + '\run-service.bat\"" /DELAY 0000:30',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     if ResultCode = 0 then
-      MsgBox('Scheduled task created: ThermopacAgent starts 30s after login.',
+      MsgBox('Scheduled task created: ThermopacAgentDev starts 30s after login.',
              mbInformation, MB_OK)
     else
       MsgBox('Warning: Could not create scheduled task (code ' + IntToStr(ResultCode) + '). ' +
@@ -217,13 +217,13 @@ begin
     MsgBox(
       'Installation complete!' + #13#10 + #13#10 +
       'NEXT STEPS:' + #13#10 +
-      '  1. Edit config.ini in the installation folder' + #13#10 +
-      '     Set api_url to your Thermopac ERP URL' + #13#10 +
-      '     Testing mode: node_token is auto-generated' + #13#10 +
+      '  1. This Dev build installs side-by-side in ThermopacAgentDev' + #13#10 +
+      '     api_url is set to the Development backend' + #13#10 +
+      '     Testing mode: node_token is auto-generated if missing' + #13#10 +
       '     Production mode: paste your admin-issued token' + #13#10 + #13#10 +
       '  2. Run ThermopacAgent from the Start Menu' + #13#10 + #13#10 +
       '  3. If SolidWorks COM errors appear, run:' + #13#10 +
-      '     Start Menu > ThermopacAgent > Repair COM Cache',
+      '     Start Menu > ThermopacAgent Dev > Repair COM Cache',
       mbInformation, MB_OK);
   end;
 end;
@@ -233,6 +233,6 @@ var
   ResultCode: Integer;
 begin
   if CurUninstallStep = usPostUninstall then
-    Exec('schtasks.exe', '/Delete /F /TN "ThermopacAgent"',
+    Exec('schtasks.exe', '/Delete /F /TN "ThermopacAgentDev"',
          '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;

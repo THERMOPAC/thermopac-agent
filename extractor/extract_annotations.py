@@ -5,7 +5,7 @@ Soft failure.
 """
 
 from __future__ import annotations
-from extractor._com_helper import sw_call, to_list
+from extractor._com_helper import sw_call, to_list, activate_sheet_and_get_current_sheet
 
 SW_ANN_NOTE         = 5
 SW_ANN_WELD_SYMBOL  = 28
@@ -28,8 +28,7 @@ def ExtractAnnotations(swApp, swModel, swDraw, logger) -> dict:
 
         for sheet_name in sheet_names:
             try:
-                sw_call(swDraw, "ActivateSheet", sheet_name)
-                swSheet = sw_call(swDraw, "GetCurrentSheet")
+                swDraw, swSheet = activate_sheet_and_get_current_sheet(swApp, swDraw, sheet_name, logger)
                 if swSheet is None:
                     continue
                 ann_views = to_list(sw_call(swSheet, "GetViews"))
@@ -69,6 +68,55 @@ def ExtractAnnotations(swApp, swModel, swDraw, logger) -> dict:
 
     except Exception as e:
         logger.error(f"[Annotations] unexpected error: {e}")
+
+    if (
+        result["notes_count"] == 0
+        and result["weld_symbols_count"] == 0
+        and result["surface_finish_count"] == 0
+        and result["gd_t_count"] == 0
+    ):
+        try:
+            ann = None
+            for method in ("GetFirstAnnotation2", "GetFirstAnnotation"):
+                try:
+                    ann = sw_call(swModel, method)
+                    if ann is not None:
+                        break
+                except Exception:
+                    pass
+            count = 0
+            while ann is not None and count < 1000:
+                try:
+                    t = sw_call(ann, "GetType")
+                    if t == SW_ANN_NOTE:
+                        result["notes_count"] += 1
+                        if len(result["notes_sample"]) < 30:
+                            try:
+                                text = str(sw_call(ann, "GetText") or "").strip()
+                                if text:
+                                    result["notes_sample"].append(text)
+                            except Exception:
+                                pass
+                    elif t == SW_ANN_WELD_SYMBOL:
+                        result["weld_symbols_count"] += 1
+                    elif t == SW_ANN_SURFACE:
+                        result["surface_finish_count"] += 1
+                    elif t == SW_ANN_GTOL:
+                        result["gd_t_count"] += 1
+                except Exception:
+                    pass
+                next_ann = None
+                for method in ("GetNext3", "GetNext2", "GetNext"):
+                    try:
+                        next_ann = sw_call(ann, method)
+                        break
+                    except Exception:
+                        pass
+                ann = next_ann
+                count += 1
+            logger.info(f"[Annotations] model annotation traversal count={count}")
+        except Exception as e:
+            logger.debug(f"[Annotations] model annotation traversal failed: {e}")
 
     logger.info(f"[Annotations] notes={result['notes_count']} "
                 f"welds={result['weld_symbols_count']} "

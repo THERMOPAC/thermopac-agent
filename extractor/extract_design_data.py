@@ -20,7 +20,7 @@ Candidate scoring:
 """
 
 from __future__ import annotations
-from extractor._com_helper import sw_call, to_list
+from extractor._com_helper import sw_call, to_list, activate_sheet_and_get_current_sheet
 
 SW_TABLE_ANNOTATION_GENERAL  = 11
 SW_TABLE_ANNOTATION_BOM      = 0
@@ -64,7 +64,7 @@ class DesignDataNotFoundError(Exception):
 
 def ExtractDesignDataTable(swApp, swModel, swDraw, logger) -> dict:
     warnings = []
-    table_result = _find_design_data_table(swDraw, logger)
+    table_result = _find_design_data_table(swApp, swDraw, logger)
     if table_result.get("rows"):
         rows = table_result["rows"]
         logger.info(f"[DesignData] Found {len(rows)} row(s) from table")
@@ -202,7 +202,7 @@ def _iter_view_tables(swView, path: str, logger, fallback_list: list, titles_fou
     return None
 
 
-def _find_design_data_table(swDraw, logger) -> dict:
+def _find_design_data_table(swApp, swDraw, logger) -> dict:
     try:
         sheet_names = to_list(sw_call(swDraw, "GetSheetNames"))
         logger.info(f"[DesignData] Sheets: {sheet_names}")
@@ -263,10 +263,8 @@ def _find_design_data_table(swDraw, logger) -> dict:
     logger.info("[DesignData] Path C: per-sheet ActivateSheet sweep")
     for sname in (sheet_names or []):
         try:
-            sw_call(swDraw, "ActivateSheet", sname)
+            swDraw, swSheet2 = activate_sheet_and_get_current_sheet(swApp, swDraw, sname, logger)
             logger.info(f"[DesignData] Path C: activated sheet '{sname}'")
-            # After activation, try GetCurrentSheet
-            swSheet2 = sw_call(swDraw, "GetCurrentSheet")
             if swSheet2 is not None:
                 tbl_anns = to_list(sw_call(swSheet2, "GetTableAnnotations"))
                 logger.info(f"[DesignData] Path C sheet '{sname}': {len(tbl_anns)} table(s)")
@@ -388,8 +386,7 @@ def _find_design_data_notes(swModel, swDraw, logger) -> dict:
 
     for sheet_name in sheet_names:
         try:
-            sw_call(swDraw, "ActivateSheet", sheet_name)
-            swSheet = sw_call(swDraw, "GetCurrentSheet")
+            swDraw, swSheet = activate_sheet_and_get_current_sheet(swApp, swDraw, sheet_name, logger)
             views = to_list(sw_call(swSheet, "GetViews")) if swSheet is not None else []
             logger.info(f"[DesignData] Note/text sheet '{sheet_name}': {len(views)} view candidate(s)")
             for v_idx, view in enumerate(views):

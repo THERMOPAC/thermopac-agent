@@ -4,7 +4,7 @@ Reads sheet names, scale, paper size, and view count from the drawing.
 """
 
 from __future__ import annotations
-from extractor._com_helper import sw_call, to_list
+from extractor._com_helper import sw_call, to_list, activate_sheet_and_get_current_sheet
 
 SW_PAPER_SIZES = {
     0:  "A0", 1:  "A1", 2:  "A2",  3:  "A3",  4:  "A4",
@@ -24,8 +24,7 @@ def ExtractSheets(swApp, swModel, swDraw, logger) -> list:
         for name in sheet_names:
             entry = {"sheet_name": str(name), "scale": "", "paper_size": "", "view_count": 0}
             try:
-                sw_call(swDraw, "ActivateSheet", name)
-                swSheet = sw_call(swDraw, "GetCurrentSheet")
+                swDraw, swSheet = activate_sheet_and_get_current_sheet(swApp, swDraw, name, logger)
                 if swSheet is None:
                     result.append(entry)
                     continue

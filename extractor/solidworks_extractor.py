@@ -72,6 +72,14 @@ from extractor.extract_references    import ExtractReferences
 from extractor.extract_health        import ExtractHealth
 from extractor.extract_nozzles       import ExtractNozzles
 from extractor.extract_design_data   import ExtractDesignDataTable
+from extractor._com_helper import (
+    cast_to_drawing_doc,
+    com_type_summary,
+    get_active_doc,
+    probe_method,
+    refetch_active_drawing_doc,
+    sw_call,
+)
 
 # SolidWorks constants  (swOpenDocOptions_e)
 SW_DOC_DRAWING           = 3
@@ -104,6 +112,71 @@ def _decode_sw_error(code: int) -> str:
         return "0 (none)"
     parts = [name for bit, name in _SW_OPEN_ERRORS.items() if code & bit]
     return f"{code} ({', '.join(parts) if parts else 'unknown'})"
+
+
+def _activate_and_refetch(swApp, swModel, temp_path: str, logger, label: str):
+    candidates = []
+    doc_names = []
+    if temp_path:
+        doc_names = [temp_path, os.path.basename(temp_path), os.path.splitext(os.path.basename(temp_path))[0]]
+    for doc_name in doc_names:
+        try:
+            errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            activated = swApp.ActivateDoc3(doc_name, False, 0, errors)
+            logger.info(f"[COMDBG] ActivateDoc3 {label} name='{doc_name}' returned {type(activated).__name__ if activated else 'None'} errors={getattr(errors, 'value', '')}")
+            if activated is not None:
+                candidates.append(activated)
+        except Exception as e:
+            logger.info(f"[COMDBG] ActivateDoc3 {label} name='{doc_name}' failed: {type(e).__name__}: {e}")
+    active = get_active_doc(swApp)
+    if active is not None:
+        logger.info(f"[COMDBG] ActiveDoc {label} returned {type(active).__name__}")
+        candidates.append(active)
+    candidates.append(swModel)
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        draw = cast_to_drawing_doc(candidate)
+        first_view = probe_method(draw, "GetFirstView")
+        current_sheet = probe_method(draw, "GetCurrentSheet")
+        if first_view["call_ok"] or current_sheet["call_ok"]:
+            return candidate, draw
+    return swModel, cast_to_drawing_doc(swModel)
+
+
+def _log_com_debug(swApp, swModel, swDraw, logger, label: str):
+    for obj_label, obj in [("swModel", swModel), ("swDraw", swDraw)]:
+        summary = com_type_summary(obj)
+        logger.info(
+            f"[COMDBG] {label} {obj_label}: "
+            f"python={summary['python_module']}.{summary['python_type']} "
+            f"typeinfo='{summary['typeinfo_name']}' guid='{summary['typeattr_guid']}' repr='{summary['repr']}'"
+        )
+        for method in ("GetFirstView", "GetCurrentSheet", "GetFirstAnnotation", "GetSheetNames", "GetDimensionNames"):
+            probe = probe_method(obj, method)
+            logger.info(
+                f"[COMDBG] {label} {obj_label}.{method}: "
+                f"has={probe['has_attr']} callable={probe['callable']} ok={probe['call_ok']} "
+                f"result={probe['result_type']} preview='{probe['result_preview']}' error='{probe['error']}'"
+            )
+    try:
+        sheet_names = sw_call(swDraw, "GetSheetNames")
+        sheet_list = list(sheet_names) if hasattr(sheet_names, "__iter__") and not isinstance(sheet_names, str) else [sheet_names]
+        if sheet_list:
+            try:
+                sw_call(swDraw, "ActivateSheet", sheet_list[0])
+                _, swDraw2 = _activate_and_refetch(swApp, swModel, "", logger, f"{label}/after-sheet-activation")
+                sheet = sw_call(swDraw2, "GetCurrentSheet")
+                logger.info(f"[COMDBG] {label} current sheet object after activation: {com_type_summary(sheet)}")
+                probe = probe_method(sheet, "GetViews")
+                logger.info(
+                    f"[COMDBG] {label} currentSheet.GetViews: has={probe['has_attr']} callable={probe['callable']} "
+                    f"ok={probe['call_ok']} result={probe['result_type']} preview='{probe['result_preview']}' error='{probe['error']}'"
+                )
+            except Exception as e:
+                logger.info(f"[COMDBG] {label} sheet activation probe failed: {type(e).__name__}: {e}")
+    except Exception as e:
+        logger.info(f"[COMDBG] {label} sheet probe skipped: {type(e).__name__}: {e}")
 
 
 
@@ -431,18 +504,9 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         except Exception as e:
             logger.warning(f"[Extractor] GetType() skipped: {e} — assuming Drawing and continuing")
 
-        swDraw = swModel
-        if binding_mode == "early":
-            try:
-                swDraw = win32com.client.CastTo(swModel, "IDrawingDoc")
-                logger.info("[Extractor] CastTo IDrawingDoc: OK")
-            except Exception as e:
-                err_msg = f"{type(e).__name__}: {e}"
-                logger.warning(f"[Extractor] API call failed: CastTo(IDrawingDoc): {err_msg}; continuing best-effort")
-                result["extraction_errors"]["CastTo(IDrawingDoc)"] = err_msg
-                result["extraction_warnings"].append(f"CastTo(IDrawingDoc) unavailable: {err_msg}")
-        else:
-            logger.info("[Extractor] Late binding active — using opened model object for best-effort drawing extraction")
+        swModel, swDraw = _activate_and_refetch(swApp, swModel, temp_path, logger, "after-open")
+        _log_com_debug(swApp, swModel, swDraw, logger, "after-open")
+        swDraw = refetch_active_drawing_doc(swApp, swDraw)
 
         try:
             first_view = swDraw.GetFirstView()
