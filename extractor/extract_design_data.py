@@ -310,6 +310,43 @@ def _scan_strict_table(table_ann, label: str, blocks: dict, titles_found: list, 
     _evaluate_table_for_strict_blocks(rows, title, blocks)
 
 
+def _looks_like_table_annotation(obj) -> bool:
+    try:
+        getattr(obj, "RowCount")
+        getattr(obj, "ColumnCount")
+        return True
+    except Exception:
+        return False
+
+
+def _strict_tables_from_view(view) -> list:
+    table_anns = []
+    for method in ("GetTableAnnotations", "TableAnnotations"):
+        try:
+            table_anns = to_list(sw_call(view, method))
+            if table_anns:
+                break
+        except Exception:
+            pass
+    return table_anns or []
+
+
+def _strict_table_specific_annotations(view) -> list:
+    tables = []
+    try:
+        annotations = to_list(sw_call(view, "GetAnnotations"))
+    except Exception:
+        return tables
+    for ann in annotations or []:
+        try:
+            specific = sw_call(ann, "GetSpecificAnnotation2")
+            if specific is not None and _looks_like_table_annotation(specific):
+                tables.append(specific)
+        except Exception:
+            pass
+    return tables
+
+
 def _extract_strict_dds_blocks(swApp, swDraw, logger) -> dict:
     blocks = {
         "mechanical_design_data": _empty_dds_block(MECHANICAL_DDS_HEADERS),
@@ -378,6 +415,54 @@ def _extract_strict_dds_blocks(swApp, swDraw, logger) -> dict:
                         return {"dds_blocks": blocks, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
         except Exception as e:
             warnings.append(f"Sheet '{sname}' strict table scan failed: {e}")
+
+    for sname in (sheet_names or []):
+        entered = ""
+        try:
+            try:
+                sw_call(swDraw, "ActivateSheet", sname)
+            except Exception as e:
+                warnings.append(f"Sheet-format ActivateSheet '{sname}' failed: {e}")
+            for enter_method in ("EditTemplate", "EditSheetFormat"):
+                try:
+                    sw_call(swDraw, enter_method)
+                    entered = enter_method
+                    break
+                except Exception:
+                    pass
+            if not entered:
+                warnings.append(f"Sheet-format strict table scan failed for '{sname}': edit context unavailable")
+                continue
+            try:
+                swSheet = sw_call(swDraw, "GetCurrentSheet")
+                if swSheet is not None:
+                    table_anns = to_list(sw_call(swSheet, "GetTableAnnotations"))
+                    for i, ta in enumerate(table_anns or []):
+                        _scan_strict_table(ta, f"E/{sname}/sheet_format/{entered}/sheet/t{i}", blocks, titles_found, raw_tables, logger)
+                        if done():
+                            return {"dds_blocks": blocks, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
+            except Exception as e:
+                warnings.append(f"Sheet-format current sheet strict table scan failed for '{sname}': {e}")
+            for vnum, (_, view) in enumerate(iter_drawing_views(swDraw, [sname])):
+                try:
+                    for i, ta in enumerate(_strict_tables_from_view(view)):
+                        _scan_strict_table(ta, f"E/{sname}/sheet_format/{entered}/GetViews/v{vnum}/t{i}", blocks, titles_found, raw_tables, logger)
+                        if done():
+                            return {"dds_blocks": blocks, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
+                    for i, ta in enumerate(_strict_table_specific_annotations(view)):
+                        _scan_strict_table(ta, f"E/{sname}/sheet_format/{entered}/GetViews/v{vnum}/annotation_table{i}", blocks, titles_found, raw_tables, logger)
+                        if done():
+                            return {"dds_blocks": blocks, "table_titles_found": titles_found, "raw_tables": raw_tables, "warnings": warnings}
+                except Exception as e:
+                    warnings.append(f"Sheet-format GetViews view {vnum} strict table scan failed for '{sname}': {e}")
+        except Exception as e:
+            warnings.append(f"Sheet-format strict table scan failed for '{sname}': {e}")
+        finally:
+            if entered:
+                try:
+                    sw_call(swDraw, "EditSheet")
+                except Exception as e:
+                    warnings.append(f"Sheet-format exit failed for '{sname}': {e}")
 
     for vnum, (_, view) in enumerate(iter_drawing_views(swDraw, sheet_names)):
         try:
