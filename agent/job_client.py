@@ -8,7 +8,7 @@ import json
 from typing import Optional
 import requests
 
-AGENT_VERSION = "1.0.43"
+AGENT_VERSION = "1.0.44"
 
 
 class JobClient:

@@ -3,7 +3,7 @@ solidworks_extractor.py — Opens a dedicated SolidWorks instance and runs all
 10 extraction modules sequentially.
 
 Safety contract (from baseline v3):
-  - v1.0.43 test mode attaches to a running SolidWorks session when present so
+  - v1.0.44 test mode attaches to a running SolidWorks session when present so
     pre-opened referenced models can be detected and measured
   - If no running session exists, COM starts SolidWorks normally
   - OpenDoc6 with ReadOnly | Silent flags
@@ -442,6 +442,7 @@ def _set_doc_spec_attr(docSpec, names: tuple[str, ...], value, logger) -> str:
 
 def _activate_and_refetch(swApp, swModel, temp_path: str, logger, label: str):
     candidates = []
+    activated_candidates = []
     doc_names = []
     if temp_path:
         doc_names = [temp_path, os.path.basename(temp_path), os.path.splitext(os.path.basename(temp_path))[0]]
@@ -452,6 +453,7 @@ def _activate_and_refetch(swApp, swModel, temp_path: str, logger, label: str):
             logger.info(f"[COMDBG] ActivateDoc3 {label} name='{doc_name}' returned {type(activated).__name__ if activated else 'None'} errors={getattr(errors, 'value', '')}")
             if activated is not None:
                 candidates.append(activated)
+                activated_candidates.append((doc_name, activated))
         except Exception as e:
             logger.info(f"[COMDBG] ActivateDoc3 {label} name='{doc_name}' failed: {type(e).__name__}: {e}")
         try:
@@ -476,6 +478,15 @@ def _activate_and_refetch(swApp, swModel, temp_path: str, logger, label: str):
         current_sheet = probe_method(draw, "GetCurrentSheet")
         if first_view["call_ok"] or current_sheet["call_ok"]:
             return candidate, draw
+    for doc_name, candidate in activated_candidates:
+        if candidate is None:
+            continue
+        draw = cast_to_drawing_doc(candidate)
+        logger.info(
+            f"[COMDBG] {label}: accepting ActivateDoc3 document for '{doc_name}' "
+            "without drawing API probe success; SolidWorks may expose drawing APIs only after extraction starts"
+        )
+        return candidate, draw
     return swModel, cast_to_drawing_doc(swModel)
 
 
