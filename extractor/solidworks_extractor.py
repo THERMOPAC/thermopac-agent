@@ -128,6 +128,13 @@ def _activate_and_refetch(swApp, swModel, temp_path: str, logger, label: str):
                 candidates.append(activated)
         except Exception as e:
             logger.info(f"[COMDBG] ActivateDoc3 {label} name='{doc_name}' failed: {type(e).__name__}: {e}")
+        try:
+            opened = swApp.GetOpenDocumentByName(doc_name)
+            logger.info(f"[COMDBG] GetOpenDocumentByName {label} name='{doc_name}' returned {type(opened).__name__ if opened else 'None'}")
+            if opened is not None:
+                candidates.append(opened)
+        except Exception as e:
+            logger.info(f"[COMDBG] GetOpenDocumentByName {label} name='{doc_name}' failed: {type(e).__name__}: {e}")
     active = get_active_doc(swApp)
     if active is not None:
         logger.info(f"[COMDBG] ActiveDoc {label} returned {type(active).__name__}")
@@ -136,7 +143,9 @@ def _activate_and_refetch(swApp, swModel, temp_path: str, logger, label: str):
     for candidate in candidates:
         if candidate is None:
             continue
+        logger.info(f"[COMDBG] {label} candidate before drawing cast: {com_type_summary(candidate)}")
         draw = cast_to_drawing_doc(candidate)
+        logger.info(f"[COMDBG] {label} candidate after drawing cast: {com_type_summary(draw)}")
         first_view = probe_method(draw, "GetFirstView")
         current_sheet = probe_method(draw, "GetCurrentSheet")
         if first_view["call_ok"] or current_sheet["call_ok"]:
@@ -152,7 +161,7 @@ def _log_com_debug(swApp, swModel, swDraw, logger, label: str):
             f"python={summary['python_module']}.{summary['python_type']} "
             f"typeinfo='{summary['typeinfo_name']}' guid='{summary['typeattr_guid']}' repr='{summary['repr']}'"
         )
-        for method in ("GetFirstView", "GetCurrentSheet", "GetFirstAnnotation", "GetSheetNames", "GetDimensionNames"):
+        for method in ("GetFirstView", "GetCurrentSheet", "GetViews", "GetFirstAnnotation", "GetSheetNames", "GetDimensionNames"):
             probe = probe_method(obj, method)
             logger.info(
                 f"[COMDBG] {label} {obj_label}.{method}: "

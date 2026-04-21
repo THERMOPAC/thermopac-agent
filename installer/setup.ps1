@@ -27,7 +27,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ── Constants ────────────────────────────────────────────────────────────────
-$AGENT_VERSION   = "1.0.37"
+$AGENT_VERSION   = "1.0.38"
 $PY_VERSION      = "3.11.9"
 $PY_EMBED_ZIP    = "python-$PY_VERSION-embed-amd64.zip"
 $PY_EMBED_URL    = "https://www.python.org/ftp/python/$PY_VERSION/$PY_EMBED_ZIP"

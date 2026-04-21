@@ -5,7 +5,7 @@ Soft failure.
 """
 
 from __future__ import annotations
-from extractor._com_helper import sw_call, to_list, activate_sheet_and_get_current_sheet
+from extractor._com_helper import sw_call, to_list, activate_sheet_and_get_current_sheet, iter_drawing_views
 
 SW_TABLE_BOM       = 0
 SW_TABLE_GENERAL   = 11
@@ -79,6 +79,33 @@ def ExtractTables(swApp, swModel, swDraw, logger) -> dict:
 
     except Exception as e:
         logger.error(f"[Tables] unexpected error: {e}")
+
+    if not any([result["bom_found"], result["revision_table_found"], result["general_tolerance_table_found"]]):
+        try:
+            for _, view in iter_drawing_views(swDraw):
+                table_anns = to_list(sw_call(view, "GetTableAnnotations"))
+                for ta in table_anns:
+                    try:
+                        t_type = ta.Type
+                    except Exception:
+                        continue
+                    if t_type == SW_TABLE_BOM:
+                        result["bom_found"] = True
+                        try:
+                            result["bom_rows"] = max(result["bom_rows"], ta.RowCount - 1)
+                        except Exception:
+                            pass
+                    elif t_type == SW_TABLE_REVISION:
+                        result["revision_table_found"] = True
+                    elif t_type == SW_TABLE_GENERAL:
+                        try:
+                            title = str(ta.Title or "").lower()
+                            if "tolerance" in title or "general tol" in title:
+                                result["general_tolerance_table_found"] = True
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.debug(f"[Tables] drawing GetViews traversal failed: {e}")
 
     logger.info(f"[Tables] bom={result['bom_found']} "
                 f"revision={result['revision_table_found']} "

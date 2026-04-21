@@ -5,7 +5,7 @@ Soft failure.
 """
 
 from __future__ import annotations
-from extractor._com_helper import sw_call, to_list, activate_sheet_and_get_current_sheet
+from extractor._com_helper import sw_call, to_list, activate_sheet_and_get_current_sheet, iter_drawing_views
 
 SW_ANN_NOTE         = 5
 SW_ANN_WELD_SYMBOL  = 28
@@ -68,6 +68,35 @@ def ExtractAnnotations(swApp, swModel, swDraw, logger) -> dict:
 
     except Exception as e:
         logger.error(f"[Annotations] unexpected error: {e}")
+
+    if (
+        result["notes_count"] == 0
+        and result["weld_symbols_count"] == 0
+        and result["surface_finish_count"] == 0
+        and result["gd_t_count"] == 0
+    ):
+        try:
+            for _, view in iter_drawing_views(swDraw):
+                anns = to_list(sw_call(view, "GetAnnotations"))
+                for ann in anns:
+                    try:
+                        t = sw_call(ann, "GetType")
+                        if t == SW_ANN_NOTE:
+                            result["notes_count"] += 1
+                            if len(result["notes_sample"]) < 30:
+                                text = str(sw_call(ann, "GetText") or "").strip()
+                                if text:
+                                    result["notes_sample"].append(text)
+                        elif t == SW_ANN_WELD_SYMBOL:
+                            result["weld_symbols_count"] += 1
+                        elif t == SW_ANN_SURFACE:
+                            result["surface_finish_count"] += 1
+                        elif t == SW_ANN_GTOL:
+                            result["gd_t_count"] += 1
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug(f"[Annotations] drawing GetViews traversal failed: {e}")
 
     if (
         result["notes_count"] == 0

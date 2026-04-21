@@ -20,7 +20,7 @@ Candidate scoring:
 """
 
 from __future__ import annotations
-from extractor._com_helper import sw_call, to_list, activate_sheet_and_get_current_sheet
+from extractor._com_helper import sw_call, to_list, activate_sheet_and_get_current_sheet, iter_drawing_views
 
 SW_TABLE_ANNOTATION_GENERAL  = 11
 SW_TABLE_ANNOTATION_BOM      = 0
@@ -79,7 +79,7 @@ def ExtractDesignDataTable(swApp, swModel, swDraw, logger) -> dict:
         }
 
     warnings.extend(table_result.get("warnings", []))
-    notes_result = _find_design_data_notes(swModel, swDraw, logger)
+    notes_result = _find_design_data_notes(swApp, swModel, swDraw, logger)
     warnings.extend(notes_result.get("warnings", []))
     if notes_result.get("accepted_text"):
         logger.warning("[DesignData] Structured Design Data table missing; accepted likely Design Data note/text fallback")
@@ -290,6 +290,11 @@ def _find_design_data_table(swApp, swDraw, logger) -> dict:
             warnings.append(msg)
 
     # ─── Fallback candidate ────────────────────────────────────────────────
+    for vnum, (_, view) in enumerate(iter_drawing_views(swDraw, sheet_names)):
+        result = _iter_view_tables(view, f"D/GetViews/v{vnum}", logger, fallback_list, titles_found)
+        if result is not None:
+            return {"rows": result, "table_titles_found": titles_found, "warnings": warnings}
+
     if fallback_list:
         table_ann, label, title = fallback_list[0]
         logger.warning(f"[DesignData] Using fallback general table at '{label}' title='{title}'")
@@ -304,7 +309,7 @@ def _find_design_data_table(swApp, swDraw, logger) -> dict:
     return {"rows": [], "table_titles_found": titles_found, "warnings": warnings}
 
 
-def _find_design_data_notes(swModel, swDraw, logger) -> dict:
+def _find_design_data_notes(swApp, swModel, swDraw, logger) -> dict:
     candidates = []
     accepted = []
     warnings = []
@@ -400,6 +405,14 @@ def _find_design_data_notes(swModel, swDraw, logger) -> dict:
             msg = f"Note fallback sheet '{sheet_name}' failed: {e}"
             logger.warning(f"[DesignData] {msg}")
             warnings.append(msg)
+
+    for v_idx, view in enumerate([v for _, v in iter_drawing_views(swDraw, sheet_names)]):
+        try:
+            anns = to_list(sw_call(view, "GetAnnotations"))
+            for a_idx, ann in enumerate(anns):
+                add_candidate(f"GetViews/view{v_idx}/annotation{a_idx}", ann_text(ann))
+        except Exception as e:
+            warnings.append(f"Note fallback GetViews annotations failed on view {v_idx}: {e}")
 
     logger.info(f"[DesignData] Note/text fallback scan complete: {len(candidates)} candidate(s), {len(accepted)} accepted")
     return {"accepted_text": accepted, "candidates": candidates, "warnings": warnings}

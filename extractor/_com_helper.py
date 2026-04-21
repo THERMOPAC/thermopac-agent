@@ -16,8 +16,10 @@ from typing import Any
 
 try:
     import win32com.client
+    import pythoncom
 except Exception:
     win32com = None
+    pythoncom = None
 
 
 def sw_call(obj: Any, method: str, *args: Any) -> Any:
@@ -69,14 +71,47 @@ def to_list(val: Any) -> list:
     return [val]
 
 
+def _query_dispatch_interface(obj: Any, interface_names: tuple[str, ...]) -> Any:
+    if obj is None or win32com is None or pythoncom is None:
+        return None
+    ole = getattr(obj, "_oleobj_", None)
+    if ole is None:
+        return None
+    try:
+        ti = ole.GetTypeInfo()
+        typelib, _ = ti.GetContainingTypeLib()
+        count = typelib.GetTypeInfoCount()
+    except Exception:
+        return None
+    wanted = {name.lower() for name in interface_names}
+    for idx in range(count):
+        try:
+            type_info = typelib.GetTypeInfo(idx)
+            name = str(type_info.GetDocumentation(-1)[0] or "")
+            if name.lower() not in wanted:
+                continue
+            guid = str(type_info.GetTypeAttr()[0])
+            qi = ole.QueryInterface(pythoncom.MakeIID(guid), pythoncom.IID_IDispatch)
+            if qi is not None:
+                return win32com.client.Dispatch(qi)
+        except Exception:
+            continue
+    return None
+
+
 def cast_to_drawing_doc(obj: Any) -> Any:
     if obj is None or win32com is None:
         return obj
-    for cast_name in ("DrawingDoc", "IDrawingDoc"):
+    for cast_name in ("IDrawingDoc", "DrawingDoc"):
         try:
-            return win32com.client.CastTo(obj, cast_name)
+            casted = win32com.client.CastTo(obj, cast_name)
+            if casted is not None:
+                return casted
         except Exception:
             pass
+    queried = _query_dispatch_interface(obj, ("IDrawingDoc", "DrawingDoc"))
+    if queried is not None:
+        return queried
     return obj
 
 
@@ -113,6 +148,33 @@ def activate_sheet_and_get_current_sheet(swApp: Any, swDraw: Any, sheet_name: st
             if logger is not None:
                 logger.debug(f"[COM] GetCurrentSheet after ActivateSheet('{sheet_name}') failed on {type(candidate).__name__}: {e}")
     return active_draw, None
+
+
+def iter_drawing_views(swDraw: Any, sheet_names: list | None = None) -> list[tuple[str, Any]]:
+    try:
+        raw = sw_call(swDraw, "GetViews")
+    except Exception:
+        return []
+    groups = to_list(raw)
+    result: list[tuple[str, Any]] = []
+    current_sheet = ""
+    for idx, group in enumerate(groups):
+        if isinstance(group, str):
+            current_sheet = group
+            continue
+        if isinstance(group, (list, tuple)):
+            values = list(group)
+            sheet = sheet_names[idx] if sheet_names and idx < len(sheet_names) else current_sheet
+            if values and isinstance(values[0], str):
+                sheet = values[0]
+                values = values[1:]
+            for view in values:
+                if view is not None and not isinstance(view, str):
+                    result.append((str(sheet or ""), view))
+        elif group is not None:
+            sheet = sheet_names[idx] if sheet_names and idx < len(sheet_names) else current_sheet
+            result.append((str(sheet or ""), group))
+    return result
 
 
 def com_type_summary(obj: Any) -> dict:

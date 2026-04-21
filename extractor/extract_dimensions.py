@@ -5,7 +5,7 @@ Soft failure: errors logged, partial data returned.
 """
 
 from __future__ import annotations
-from extractor._com_helper import sw_call
+from extractor._com_helper import sw_call, iter_drawing_views, to_list
 
 
 def ExtractDimensions(swApp, swModel, swDraw, logger) -> dict:
@@ -83,7 +83,8 @@ def ExtractDimensions(swApp, swModel, swDraw, logger) -> dict:
         try:
             total = 0
             sample = []
-            swView = sw_call(swDraw, "GetFirstView")
+            view_queue = [view for _, view in iter_drawing_views(swDraw)]
+            swView = view_queue.pop(0) if view_queue else sw_call(swDraw, "GetFirstView")
             view_index = 0
             while swView is not None and view_index < 100:
                 disp_dim = None
@@ -123,10 +124,13 @@ def ExtractDimensions(swApp, swModel, swDraw, logger) -> dict:
                             pass
                     disp_dim = next_dim
                     dim_index += 1
-                try:
-                    swView = sw_call(swView, "GetNextView")
-                except Exception:
-                    break
+                if view_queue:
+                    swView = view_queue.pop(0)
+                else:
+                    try:
+                        swView = sw_call(swView, "GetNextView")
+                    except Exception:
+                        break
                 view_index += 1
             result["total_count"] = total
             result["sample"] = sample
