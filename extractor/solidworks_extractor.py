@@ -3,7 +3,7 @@ solidworks_extractor.py — Opens a dedicated SolidWorks instance and runs all
 10 extraction modules sequentially.
 
 Safety contract (from baseline v3):
-  - v1.0.44 test mode attaches to a running SolidWorks session when present so
+  - v1.0.45 test mode attaches to a running SolidWorks session when present so
     pre-opened referenced models can be detected and measured
   - If no running session exists, COM starts SolidWorks normally
   - OpenDoc6 with ReadOnly | Silent flags

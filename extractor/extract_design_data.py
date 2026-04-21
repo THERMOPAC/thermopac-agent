@@ -22,6 +22,11 @@ Candidate scoring:
 from __future__ import annotations
 from extractor._com_helper import get_com_value, sw_call, to_list, activate_sheet_and_get_current_sheet, iter_drawing_views
 
+try:
+    import pythoncom
+except Exception:
+    pythoncom = None
+
 SW_TABLE_ANNOTATION_GENERAL_TYPES  = {0, 11}
 SW_TABLE_ANNOTATION_BOM_TYPES      = {2}
 
@@ -57,6 +62,51 @@ _TITLE_MATCHES = [
     "data",
     "general table",
 ]
+
+
+def _invoke_member(obj, name: str, *args):
+    try:
+        attr = getattr(obj, name)
+        if callable(attr):
+            return attr(*args)
+        if not args:
+            return attr
+    except Exception:
+        pass
+    if pythoncom is not None:
+        try:
+            ole = getattr(obj, "_oleobj_", None)
+            if ole is not None:
+                dispid = ole.GetIDsOfNames(name)
+                for flag in (pythoncom.DISPATCH_PROPERTYGET, pythoncom.DISPATCH_METHOD):
+                    try:
+                        return ole.Invoke(dispid, 0, flag, 1, *args)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    raise AttributeError(f"COM member {name} unavailable")
+
+
+def _cell_text(table_ann, row: int, col: int) -> str:
+    attempts = (
+        ("Text", (row, col)),
+        ("Text2", (row, col, False)),
+        ("DisplayedText", (row, col)),
+        ("DisplayedText2", (row, col, False)),
+        ("GetCellText", (row, col)),
+        ("GetCellText2", (row, col, False)),
+    )
+    for name, args in attempts:
+        try:
+            value = _invoke_member(table_ann, name, *args)
+            if value is not None:
+                text = str(value).strip()
+                if text and not text.lower().startswith("<comobject"):
+                    return text
+        except Exception:
+            pass
+    return ""
 
 
 class DesignDataNotFoundError(Exception):
@@ -124,7 +174,7 @@ def _score_dds_candidate(table_ann, logger) -> int:
     for r in range(min(nrows, 40)):
         for c in range(min(ncols, 4)):
             try:
-                cell = str(sw_call(table_ann, "Text", r, c) or "").lower()
+                cell = _cell_text(table_ann, r, c).lower()
                 text_blob += " " + cell
             except Exception:
                 pass
@@ -142,7 +192,7 @@ def _read_table_raw(table_ann, logger, label: str, max_rows: int = 30, max_cols:
         cells = []
         for c in range(min(col_count, max_cols)):
             try:
-                cells.append(str(sw_call(table_ann, "Text", r, c) or "").strip())
+                cells.append(_cell_text(table_ann, r, c))
             except Exception:
                 cells.append("")
         if any(cells):
@@ -198,7 +248,7 @@ def _check_table(table_ann, label: str, logger, fallback_list: list, titles_foun
     # Accumulate fallback candidate (first general table with parameter-like first cell)
     if is_general and not fallback_list:
         try:
-            header = str(sw_call(table_ann, "Text", 0, 0) or "").lower()
+            header = _cell_text(table_ann, 0, 0).lower()
             blob = " ".join(" ".join(row) for row in raw_rows).lower()
             if any(k in blob for k in ("parameter", "description", "item", "design", "pressure", "temperature", "capacity", "material", "shell", "dish")):
                 fallback_list.append((table_ann, label, title))
@@ -468,7 +518,7 @@ def _parse_table(table_ann, logger, label: str) -> list:
             cells = []
             for c in range(col_count):
                 try:
-                    cells.append(str(sw_call(table_ann, "Text", r, c) or "").strip())
+                    cells.append(_cell_text(table_ann, r, c))
                 except Exception:
                     cells.append("")
             if not any(cells):
