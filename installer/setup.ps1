@@ -27,7 +27,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ── Constants ────────────────────────────────────────────────────────────────
-$AGENT_VERSION   = "1.0.34"
+$AGENT_VERSION   = "1.0.35"
 $PY_VERSION      = "3.11.9"
 $PY_EMBED_ZIP    = "python-$PY_VERSION-embed-amd64.zip"
 $PY_EMBED_URL    = "https://www.python.org/ftp/python/$PY_VERSION/$PY_EMBED_ZIP"
@@ -35,6 +35,7 @@ $GET_PIP_URL     = "https://bootstrap.pypa.io/get-pip.py"
 $PY_PTH_FILE     = "python311._pth"
 $REQUIRED_PKGS   = @("pywin32>=306", "requests>=2.31.0")
 $APP_URL         = "https://5d05ae61-8225-4651-bb76-b4e20a4ddabb-00-3mex6zlihlmft.janeway.replit.dev"
+$LEGACY_APP_URL  = "https://thermopac-communication-thermopacllp.replit.app"
 
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $SourceDir  = Split-Path -Parent $ScriptDir  # local-agent root
@@ -455,7 +456,14 @@ model_search_path =
     Set-Content $config_path $config_content -Encoding UTF8
     Write-OK "Created: $config_path"
 } else {
-    Write-OK "Existing config.ini preserved: $config_path"
+    $existing_config = Get-Content $config_path -Raw
+    if ($existing_config -like "*$LEGACY_APP_URL*") {
+        $existing_config = $existing_config.Replace($LEGACY_APP_URL, $APP_URL)
+        Set-Content $config_path $existing_config -Encoding UTF8
+        Write-OK "Updated existing config.ini api_url to Development backend: $config_path"
+    } else {
+        Write-OK "Existing config.ini preserved: $config_path"
+    }
 }
 
 # ── Step 10: Create run scripts ───────────────────────────────────────────────
