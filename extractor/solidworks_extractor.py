@@ -81,16 +81,6 @@ except ImportError:
     WIN32GUI_AVAILABLE = False
 
 
-from extractor.extract_properties       import ExtractProperties
-from extractor.extract_sheets           import ExtractSheets
-from extractor.extract_views            import ExtractViews
-from extractor.extract_dimensions       import ExtractDimensions
-from extractor.extract_annotations      import ExtractAnnotations
-from extractor.extract_tables           import ExtractTables
-from extractor.extract_references       import ExtractReferences
-from extractor.extract_health           import ExtractHealth
-from extractor.extract_nozzles          import ExtractNozzles
-from extractor.extract_design_data      import ExtractDesignDataTable
 from extractor.verify_custom_properties import verify_custom_properties
 from extractor._com_helper import (
     cast_to_drawing_doc,
@@ -404,25 +394,148 @@ def _detect_preopened_dependencies(swApp, reference_diagnostics: dict, logger) -
     return diagnostics
 
 
-def _summarize_extraction_result(result: dict) -> dict:
-    views = result.get("views") or []
-    dimensions = result.get("dimensions") or {}
-    annotations = result.get("annotations") or {}
-    tables = result.get("tables") or {}
-    design_data = result.get("design_data") or {}
-    model_refs = [v.get("model_reference") for v in views if isinstance(v, dict) and v.get("model_reference")]
-    summary = {
-        "views_total": len(views),
-        "model_reference_populated_count": len(model_refs),
-        "model_reference_unique_count": len(set(model_refs)),
-        "dimensions_total_count": int(dimensions.get("total_count") or 0),
-        "annotations_total_seen": int(annotations.get("total_annotations_seen") or 0),
-        "bom_found": bool(tables.get("bom_found")),
-        "bom_rows": int(tables.get("bom_rows") or 0),
-        "design_data_status": design_data.get("status", ""),
-        "design_data_source": design_data.get("source", ""),
+# ── Target properties for Layer 1 extraction ──────────────────────────────────
+_TARGET_PROPERTIES = [
+    "HYDRO_TEST_POSITION",
+    "SHELL_IDP", "SHELL_MOT",
+    "TUBE_IDP",  "TUBE_MOT",
+    "JACKET_IDP", "JACKET_MOT",
+    "Drawing_Number", "Tag_No", "Equipment_Type", "Equipment_Configuration",
+    "Design_Code", "Material_Code", "Inspection_By",
+    "DrawnBy", "DrawnDate", "CheckedBy", "CheckedDate",
+    "EngineeringApproval", "EngAppDate",
+    "Revision",
+]
+
+
+def _read_cpm(mgr, source_label: str, logger) -> dict[str, str]:
+    """Read all properties from a CustomPropertyManager; return name→value dict."""
+    try:
+        names = mgr.GetNames()
+        if not names:
+            return {}
+        result: dict[str, str] = {}
+        for name in names:
+            try:
+                ret = mgr.Get5(name, False)
+                # Get5 tuple: (retval, val, resolvedVal, wasResolved, linkToProp)
+                resolved = ret[2] if isinstance(ret, (list, tuple)) and len(ret) > 2 else ""
+                result[name] = str(resolved).strip() if resolved else ""
+            except Exception as ex:
+                logger.debug(f"[CP] {source_label}: cannot read '{name}': {ex}")
+        logger.info(
+            f"[CP] {source_label}: {len(result)} properties detected: {list(result.keys())}"
+        )
+        return result
+    except Exception as e:
+        logger.warning(f"[CP] {source_label}: GetNames failed: {e}")
+        return {}
+
+
+def _extract_custom_properties(swApp, swModel, logger) -> dict:
+    """
+    Extract target custom properties from three sources (priority order):
+      1. Drawing-level  — CustomPropertyManager("")
+      2. Sheet-level    — CustomPropertyManager(active_sheet_name)
+      3. Model-level    — referenced part/assembly CustomPropertyManager("")
+
+    Returns:
+      {
+        "bySource":   {"drawing": {...}, "sheet": {...}, "model": {...}},
+        "resolved":   {"prop": {"value": str, "source": str}, ...},
+        "allDetected": {"drawing": [...], "sheet": [...], "model": [...]},
+        "totalFound": int,
+      }
+    """
+    by_source: dict[str, dict] = {"drawing": {}, "sheet": {}, "model": {}}
+    all_detected: dict[str, list] = {"drawing": [], "sheet": [], "model": []}
+
+    # 1. Drawing-level
+    try:
+        mgr = swModel.Extension.CustomPropertyManager("")
+        by_source["drawing"] = _read_cpm(mgr, "drawing", logger)
+        all_detected["drawing"] = list(by_source["drawing"].keys())
+    except Exception as e:
+        logger.warning(f"[CP] Drawing-level CustomPropertyManager failed: {e}")
+
+    # 2. Sheet-level
+    try:
+        sheet_name: str | None = None
+        try:
+            sheets = swModel.GetSheetNames()
+            if sheets:
+                sheet_name = str(sheets[0])
+        except Exception:
+            pass
+        if sheet_name:
+            mgr = swModel.Extension.CustomPropertyManager(sheet_name)
+            by_source["sheet"] = _read_cpm(mgr, f"sheet({sheet_name})", logger)
+            all_detected["sheet"] = list(by_source["sheet"].keys())
+        else:
+            logger.info("[CP] Sheet-level: no sheet name available")
+    except Exception as e:
+        logger.warning(f"[CP] Sheet-level failed: {e}")
+
+    # 3. Model-level (first referenced part/assembly found in dependencies)
+    try:
+        model_doc = None
+        try:
+            path = swModel.GetPathName()
+            deps = swApp.GetDocumentDependencies2(path, False, True, False) or []
+            for dep in deps:
+                dep_str = str(dep or "")
+                if dep_str.lower().endswith((".sldprt", ".sldasm")):
+                    for try_name in (dep_str, os.path.basename(dep_str)):
+                        try:
+                            errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+                            candidate = swApp.ActivateDoc3(try_name, False, 0, errors)
+                            if candidate is not None:
+                                model_doc = candidate
+                                logger.info(f"[CP] Model-level: found referenced doc '{try_name}'")
+                                break
+                        except Exception:
+                            pass
+                if model_doc is not None:
+                    break
+        except Exception as dep_e:
+            logger.debug(f"[CP] GetDocumentDependencies2 for model: {dep_e}")
+
+        if model_doc is not None:
+            mgr = model_doc.Extension.CustomPropertyManager("")
+            by_source["model"] = _read_cpm(mgr, "model", logger)
+            all_detected["model"] = list(by_source["model"].keys())
+        else:
+            logger.info("[CP] Model-level: no referenced model document accessible")
+    except Exception as e:
+        logger.warning(f"[CP] Model-level failed: {e}")
+
+    # Resolve priority: drawing > sheet > model
+    resolved: dict[str, dict] = {}
+    for prop in _TARGET_PROPERTIES:
+        found = False
+        for src in ("drawing", "sheet", "model"):
+            val = by_source[src].get(prop)
+            if val is not None and val != "":
+                resolved[prop] = {"value": val, "source": src}
+                found = True
+                break
+        if not found:
+            resolved[prop] = {"value": "", "source": "none"}
+
+    total_found = sum(1 for v in resolved.values() if v["value"])
+    logger.info(f"[CP] Resolution complete: {total_found}/{len(_TARGET_PROPERTIES)} target properties found")
+    for prop, info in resolved.items():
+        if info["value"]:
+            logger.info(f"[CP]   {prop} = {info['value']!r}  (source={info['source']})")
+        else:
+            logger.info(f"[CP]   {prop} = MISSING")
+
+    return {
+        "bySource":    by_source,
+        "resolved":    resolved,
+        "allDetected": all_detected,
+        "totalFound":  total_found,
     }
-    return summary
 
 
 def _set_doc_spec_attr(docSpec, names: tuple[str, ...], value, logger) -> str:
@@ -632,39 +745,16 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
     logger.info(f"[Extractor] Using ProgID: {config.sw_progid}")
 
     result = {
-        "schema_version": "1.0",
-        "agent":          {},        # stamped by runner
+        "schema_version":             "1.1",
+        "agent":                      {},   # stamped by runner
         "file": {
             "original_filename": filename,
             "file_size_bytes":   file_size,
             "sha256":            sha256,
         },
-        "properties":         {},
-        "sheets":             [],
-        "views":              [],
-        "dimensions":         {},
-        "annotations":        {},
-        "tables":             {},
-        "references":         {},
-        "health":             {},
-        "nozzles":            {},
-        "design_data":                {},
-        "design_data_table":          {},
         "customPropertyVerification": {},
-        "extraction_warnings": [],
-        "extraction_errors": {
-            "properties":                 None,
-            "sheets":                     None,
-            "views":                      None,
-            "dimensions":                 None,
-            "annotations":               None,
-            "tables":                    None,
-            "references":                None,
-            "health":                    None,
-            "nozzles":                   None,
-            "design_data_table":         None,
-            "customPropertyVerification": None,
-        },
+        "extraction_warnings":        [],
+        "extraction_errors":          {},
     }
 
     swApp  = None
@@ -935,84 +1025,25 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
 
         swModel, swDraw = _activate_and_refetch(swApp, swModel, temp_path, logger, "after-open")
         _log_com_debug(swApp, swModel, swDraw, logger, "after-open")
-        swDraw = refetch_active_drawing_doc(swApp, swDraw)
 
+        # ── Layer 1: Custom property extraction + verification ─────────────────
+        _check_cancel(cancel_event, "before custom property extraction")
         try:
-            first_view = swDraw.GetFirstView()
-            logger.info(
-                "[Extractor] GetFirstView: OK"
-                + (" (view returned)" if first_view else " (None — may activate sheet first)")
-            )
-        except Exception as e:
-            err_msg = f"{type(e).__name__}: {e}"
-            logger.warning(f"[Extractor] API call failed: IDrawingDoc.GetFirstView: {err_msg}; continuing best-effort")
-            result["extraction_errors"]["IDrawingDoc.GetFirstView"] = err_msg
-            result["extraction_warnings"].append(f"IDrawingDoc.GetFirstView unavailable: {err_msg}")
-
-        # ── Run modules ───────────────────────────────────────────────────────
-        modules = [
-            ("properties",        lambda: ExtractProperties(swApp, swModel, logger)),
-            ("sheets",            lambda: ExtractSheets(swApp, swModel, swDraw, logger)),
-            ("views",             lambda: ExtractViews(swApp, swModel, swDraw, logger)),
-            ("dimensions",        lambda: ExtractDimensions(swApp, swModel, swDraw, logger)),
-            ("annotations",       lambda: ExtractAnnotations(swApp, swModel, swDraw, logger)),
-            ("tables",            lambda: ExtractTables(swApp, swModel, swDraw, logger)),
-            ("references",        lambda: ExtractReferences(swApp, swModel, swDraw, logger)),
-            ("health",            lambda: ExtractHealth(swApp, swModel, swDraw, logger)),
-            ("nozzles",           lambda: ExtractNozzles(swApp, swModel, swDraw, logger)),
-            ("design_data_table", lambda: ExtractDesignDataTable(
-                swApp, swModel, swDraw, logger)),
-        ]
-
-        for key, fn in modules:
-            _check_cancel(cancel_event, f"before {key}")
-            t0 = time.monotonic()
-            try:
-                result[key] = fn()
-                logger.debug(f"[Extractor] {key} OK ({time.monotonic() - t0:.2f}s)")
-            except Exception as e:
-                err_msg = f"{type(e).__name__}: {e}"
-                logger.error(f"[Extractor] {key} SOFT FAIL: {err_msg}")
-                result["extraction_errors"][key] = err_msg
-                result["extraction_warnings"].append(f"{key} extraction failed: {err_msg}")
-
-        ddt = result.get("design_data_table") or {}
-        result["design_data"] = {
-            "status": ddt.get("status", "missing" if not ddt.get("found") else "found"),
-            "source": ddt.get("source", "missing"),
-        }
-        for warning in ddt.get("warnings", []) or []:
-            if warning not in result["extraction_warnings"]:
-                result["extraction_warnings"].append(warning)
-
-        result["extraction_summary"] = _summarize_extraction_result(result)
-        result["open_diagnostics"]["post_open_extraction_summary"] = result["extraction_summary"]
-        logger.info(
-            "[Extractor] Post-open extraction summary: "
-            f"model_refs={result['extraction_summary']['model_reference_populated_count']}/{result['extraction_summary']['views_total']} "
-            f"dims={result['extraction_summary']['dimensions_total_count']} "
-            f"annotations={result['extraction_summary']['annotations_total_seen']} "
-            f"bom_found={result['extraction_summary']['bom_found']} "
-            f"design_data={result['extraction_summary']['design_data_status']}:{result['extraction_summary']['design_data_source']}"
-        )
-
-        # ── Layer 1: Custom Property Verification ──────────────────────────────
-        try:
-            cp_result = verify_custom_properties(
-                result.get("properties", {}).get("custom_properties", {}),
-                result.get("design_data_table", {}),
-                logger,
-            )
+            cp_extraction = _extract_custom_properties(swApp, swModel, logger)
+            cp_result = verify_custom_properties(cp_extraction, logger)
             result.update(cp_result)
             cp_status = result.get("customPropertyVerification", {}).get("status", "unknown")
-            logger.info(f"[Extractor] customPropertyVerification: status={cp_status}")
+            eq_cfg = result.get("customPropertyVerification", {}).get("equipmentConfig", "")
+            logger.info(
+                f"[Extractor] customPropertyVerification: status={cp_status} equipmentConfig={eq_cfg!r}"
+            )
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
             logger.error(f"[Extractor] customPropertyVerification SOFT FAIL: {err_msg}")
             result["extraction_errors"]["customPropertyVerification"] = err_msg
             result["extraction_warnings"].append(f"customPropertyVerification failed: {err_msg}")
 
-        logger.info("[Extractor] All modules complete")
+        logger.info("[Extractor] Layer 1 extraction complete")
         return result
 
     finally:
