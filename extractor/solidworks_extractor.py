@@ -572,82 +572,125 @@ def _extract_custom_properties(swApp, swModel, logger) -> dict:
     try:
         model_doc = None
 
-        def _is_part_or_asm(doc) -> bool:
-            """Return True only if doc is a Part or Assembly (not a Drawing)."""
+        def _disp(obj):
+            """
+            Wrap a raw COM pointer (PyIDispatch) in a win32com CDispatch so that
+            named attribute/property access works.  Passes CDispatch through as-is.
+            Returns None if obj is None or wrapping fails.
+            """
+            if obj is None:
+                return None
             try:
-                t = doc.GetType()
-                return t in (1, 2)   # 1=Part, 2=Assembly
+                return win32com.client.Dispatch(obj)
+            except Exception:
+                return None
+
+        def _is_part_or_asm(doc) -> bool:
+            """Return True only if doc is a Part(1) or Assembly(2), not Drawing(3)."""
+            try:
+                t = _disp(doc).GetType()
+                return t in (1, 2)
             except Exception:
                 return False
 
+        def _safe_path(doc) -> str:
+            try:
+                return _disp(doc).GetPathName() or "(no path)"
+            except Exception:
+                return "(unknown)"
+
         def _try_activate_part(name: str) -> object | None:
-            """Activate by name; return doc only if it is a Part or Assembly."""
+            """Activate by name; return dispatched doc only if it is Part/Assembly."""
             try:
                 err_v = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-                doc = swApp.ActivateDoc3(name, False, 0, err_v)
+                raw = swApp.ActivateDoc3(name, False, 0, err_v)
+                doc = _disp(raw)
                 if doc is not None and _is_part_or_asm(doc):
                     return doc
+                if doc is not None:
+                    logger.debug(f"[CP] _try_activate_part({name!r}): got type={doc.GetType()} — not Part/Asm, skipping")
                 return None
-            except Exception:
+            except Exception as e:
+                logger.debug(f"[CP] _try_activate_part({name!r}): {e}")
                 return None
 
-        # Pass 1 — traverse drawing views to reach ReferencedDocument
-        # Confirmed working: GetViews returns ((<PyIDispatch ...>,),)
+        # ─── Pass 1 ──────────────────────────────────────────────────────────
+        # Traverse drawing views → view.ReferencedDocument
+        # GetViews returns ((<PyIDispatch>,),) — wrap each view with _disp().
         try:
             views_result = _com_call(swModel, "GetViews")
+            logger.info(f"[CP] Pass1 GetViews raw type={type(views_result).__name__} len={len(views_result) if views_result else 0}")
             if views_result and isinstance(views_result, (list, tuple)):
-                for sheet_entry in views_result:
+                for si, sheet_entry in enumerate(views_result):
                     if sheet_entry is None:
                         continue
                     view_list = sheet_entry if isinstance(sheet_entry, (list, tuple)) else [sheet_entry]
-                    for view in view_list:
+                    logger.info(f"[CP] Pass1 sheet[{si}]: {len(view_list)} view(s)")
+                    for vi, raw_view in enumerate(view_list):
+                        if raw_view is None:
+                            continue
+                        view = _disp(raw_view)
                         if view is None:
+                            logger.warning(f"[CP] Pass1 sheet[{si}] view[{vi}]: _disp() returned None")
                             continue
                         try:
-                            ref_doc = view.ReferencedDocument
+                            ref_raw  = view.ReferencedDocument
+                            ref_doc  = _disp(ref_raw)
+                            logger.info(f"[CP] Pass1 view[{vi}].ReferencedDocument → {type(ref_raw).__name__}")
                             if ref_doc is not None and _is_part_or_asm(ref_doc):
                                 model_doc = ref_doc
-                                try:
-                                    ref_path = ref_doc.GetPathName()
-                                except Exception:
-                                    ref_path = "(unknown)"
-                                logger.info(
-                                    f"[CP] Model-level Pass1: view.ReferencedDocument → {ref_path!r}"
-                                )
+                                logger.info(f"[CP] Model-level Pass1 ✓ view.ReferencedDocument → {_safe_path(model_doc)!r}")
                                 break
+                            elif ref_doc is not None:
+                                try:
+                                    t = ref_doc.GetType()
+                                except Exception:
+                                    t = "?"
+                                logger.warning(f"[CP] Pass1 view[{vi}].ReferencedDocument type={t} — not Part/Asm")
+                            else:
+                                logger.warning(f"[CP] Pass1 view[{vi}].ReferencedDocument is None")
                         except Exception as ve:
-                            logger.debug(f"[CP] view.ReferencedDocument: {ve}")
+                            logger.warning(f"[CP] Pass1 view[{vi}].ReferencedDocument: {ve}")
                     if model_doc is not None:
                         break
         except Exception as vp_e:
-            logger.debug(f"[CP] Pass1 GetViews traversal: {vp_e}")
+            logger.warning(f"[CP] Pass1 GetViews traversal failed: {vp_e}")
 
-        # Pass 2 — GetDocumentDependencies2 → ActivateDoc3 with type check
+        # ─── Pass 2 ──────────────────────────────────────────────────────────
+        # GetDocumentDependencies2 → ActivateDoc3(full_path, basename, stem)
         if model_doc is None:
             try:
                 drw_path = swModel.GetPathName() or ""
                 deps = swApp.GetDocumentDependencies2(drw_path, False, True, False) or []
+                logger.info(f"[CP] Pass2 GetDocumentDependencies2('{drw_path}'): {len(deps)} entries")
                 for dep in deps:
                     dep_str = str(dep or "")
                     if not dep_str.lower().endswith((".sldprt", ".sldasm")):
                         continue
                     basename = os.path.basename(dep_str)
                     stem     = os.path.splitext(basename)[0]
+                    logger.info(f"[CP] Pass2 dep={dep_str!r} → trying (full, base, stem)")
                     for try_name in (dep_str, basename, stem):
                         doc = _try_activate_part(try_name)
                         if doc is not None:
                             model_doc = doc
-                            logger.info(f"[CP] Model-level Pass2: ActivateDoc3({try_name!r}) → Part/Asm")
+                            logger.info(f"[CP] Model-level Pass2 ✓ ActivateDoc3({try_name!r}) → Part/Asm")
                             break
                     if model_doc is not None:
                         break
+                if model_doc is None:
+                    logger.warning("[CP] Pass2: no Part/Asm found via ActivateDoc3")
             except Exception as dep_e:
-                logger.debug(f"[CP] Pass2 GetDocumentDependencies2: {dep_e}")
+                logger.warning(f"[CP] Pass2 GetDocumentDependencies2: {dep_e}")
 
-        # Pass 3 — walk GetFirstDocument → GetNext chain, pick first Part/Asm
+        # ─── Pass 3 ──────────────────────────────────────────────────────────
+        # Walk GetFirstDocument → GetNext, pick first Part/Asm.
+        # Documents are PyIDispatch in late-bind; must _disp() each.
         if model_doc is None:
             try:
-                doc = _com_call(swApp, "GetFirstDocument")
+                raw_first = _com_call(swApp, "GetFirstDocument")
+                doc = _disp(raw_first)
+                logger.info(f"[CP] Pass3 GetFirstDocument → {type(raw_first).__name__}")
                 seen: set[int] = set()
                 iters = 0
                 while doc is not None and iters < 20:
@@ -656,20 +699,25 @@ def _extract_custom_properties(swApp, swModel, logger) -> dict:
                     if doc_id in seen:
                         break
                     seen.add(doc_id)
-                    if _is_part_or_asm(doc):
-                        model_doc = doc
-                        try:
-                            p = doc.GetPathName()
-                        except Exception:
-                            p = "(unknown)"
-                        logger.info(f"[CP] Model-level Pass3: open-doc scan found Part/Asm {p!r}")
-                        break
                     try:
-                        doc = _com_call(doc, "GetNext")
+                        t = doc.GetType()
+                        p = _safe_path(doc)
+                        logger.info(f"[CP] Pass3 doc[{iters}] type={t} path={p!r}")
+                        if t in (1, 2):
+                            model_doc = doc
+                            logger.info(f"[CP] Model-level Pass3 ✓ open-doc scan → {p!r}")
+                            break
+                    except Exception as te:
+                        logger.warning(f"[CP] Pass3 doc[{iters}].GetType: {te}")
+                    try:
+                        raw_next = _com_call(doc, "GetNext")
+                        doc = _disp(raw_next)
                     except Exception:
                         break
+                if model_doc is None:
+                    logger.warning(f"[CP] Pass3: scanned {iters} doc(s), no Part/Asm found")
             except Exception as scan_e:
-                logger.debug(f"[CP] Pass3 open-doc scan: {scan_e}")
+                logger.warning(f"[CP] Pass3 open-doc scan: {scan_e}")
 
         if model_doc is not None:
             mgr = model_doc.Extension.CustomPropertyManager("")
