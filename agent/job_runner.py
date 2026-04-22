@@ -154,17 +154,20 @@ def _machine_name() -> str:
 
 def _debug_payload(payload: dict, job_id: int, logger) -> None:
     """Log a one-line summary of the final payload before upload."""
-    keys = list(payload.keys())
-    props_val      = payload.get("properties")
-    cpv_val        = payload.get("customPropertyVerification")
-    summary_val    = payload.get("extraction_summary")
-    props_status   = "object" if isinstance(props_val, dict) else ("null" if props_val is None else type(props_val).__name__)
-    cpv_status     = "object" if isinstance(cpv_val,   dict) else ("null" if cpv_val   is None else type(cpv_val).__name__)
-    summary_status = "object" if isinstance(summary_val, dict) else ("null" if summary_val is None else type(summary_val).__name__)
+    keys   = list(payload.keys())
+    cp_val = payload.get("customProperties")
+    cpv_val = payload.get("customPropertyVerification")
+
+    def _status(v):
+        if isinstance(v, dict):
+            return f"object(keys={list(v.keys())})"
+        return "null" if v is None else type(v).__name__
+
+    cp_fields = len(cp_val.get("fields", [])) if isinstance(cp_val, dict) else "n/a"
+    cpv_status = (cp_val or {}).get("status", "n/a") if isinstance(cpv_val, dict) else "n/a"
     logger.info(
         f"[Runner] Pre-upload payload job {job_id}: "
         f"keys={keys} | "
-        f"properties={props_status} | "
-        f"customPropertyVerification={cpv_status} | "
-        f"extraction_summary={summary_status}"
+        f"customProperties={_status(cp_val)} fields={cp_fields} | "
+        f"customPropertyVerification={_status(cpv_val)} status={cpv_status}"
     )

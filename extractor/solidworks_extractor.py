@@ -1070,27 +1070,28 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
             cp_result = verify_custom_properties(cp_extraction, logger)
             result.update(cp_result)
 
-            # ── Populate `properties` from all three extraction sources ──────
-            by_src = cp_extraction.get("bySource", {})
-            result["properties"] = {
-                "drawing":  by_src.get("drawing", {}),
-                "sheet":    by_src.get("sheet",   {}),
-                "model":    by_src.get("model",   {}),
-                "resolved": cp_extraction.get("resolved", {}),
-            }
-
-            # ── Populate `extraction_summary` ────────────────────────────────
+            # ── Populate `customProperties` — flat field list ─────────────
+            resolved_map = cp_extraction.get("resolved", {})
             total_target = len(_TARGET_PROPERTIES)
             total_found  = cp_extraction.get("totalFound", 0)
-            result["extraction_summary"] = {
-                "target_properties_total": total_target,
-                "target_properties_found": total_found,
-                "missing_count":           total_target - total_found,
-                "source_summary": {
-                    "drawing": len(by_src.get("drawing", {})),
-                    "sheet":   len(by_src.get("sheet",   {})),
-                    "model":   len(by_src.get("model",   {})),
-                },
+            cp_fields = []
+            for prop in _TARGET_PROPERTIES:
+                info   = resolved_map.get(prop, {"value": "", "source": "none"})
+                val    = info.get("value", "")
+                source = info.get("source", "none")
+                found  = bool(val) and source != "none"
+                cp_fields.append({
+                    "property":      prop,
+                    "value":         val,
+                    "resolvedValue": val,
+                    "source":        source,
+                    "found":         found,
+                })
+            result["customProperties"] = {
+                "fields":           cp_fields,
+                "foundCount":       total_found,
+                "missingCount":     total_target - total_found,
+                "totalTargetCount": total_target,
             }
 
             cp_status = result.get("customPropertyVerification", {}).get("status", "unknown")
