@@ -408,19 +408,41 @@ _TARGET_PROPERTIES = [
 ]
 
 
+def _com_call(obj, method: str, *args):
+    """
+    Call a COM method or read a COM property uniformly.
+    In late-bound mode some APIs (GetNames, GetSheetNames) are exposed as
+    properties (callable=False) rather than methods — accessing them with ()
+    raises 'tuple object is not callable'.  This helper handles both cases.
+    """
+    raw = getattr(obj, method)
+    if callable(raw):
+        return raw(*args)
+    # Property access — args are ignored (properties have no call-time args)
+    return raw
+
+
 def _read_cpm(mgr, source_label: str, logger) -> dict[str, str]:
     """Read all properties from a CustomPropertyManager; return name→value dict."""
     try:
-        names = mgr.GetNames()
+        names = _com_call(mgr, "GetNames")
         if not names:
             return {}
         result: dict[str, str] = {}
         for name in names:
             try:
-                ret = mgr.Get5(name, False)
-                # Get5 tuple: (retval, val, resolvedVal, wasResolved, linkToProp)
-                resolved = ret[2] if isinstance(ret, (list, tuple)) and len(ret) > 2 else ""
-                result[name] = str(resolved).strip() if resolved else ""
+                # Get5: (retval, val, resolvedVal, wasResolved, linkToProp)
+                # In late-bound mode Get5 may not exist; fall back to Get4 / Get2
+                resolved = ""
+                for api, idx in (("Get5", 2), ("Get4", 2), ("Get2", 1)):
+                    try:
+                        ret = getattr(mgr, api)(name, False)
+                        if isinstance(ret, (list, tuple)) and len(ret) > idx:
+                            resolved = str(ret[idx]).strip()
+                        break
+                    except Exception:
+                        continue
+                result[name] = resolved
             except Exception as ex:
                 logger.debug(f"[CP] {source_label}: cannot read '{name}': {ex}")
         logger.info(
@@ -462,7 +484,7 @@ def _extract_custom_properties(swApp, swModel, logger) -> dict:
     try:
         sheet_name: str | None = None
         try:
-            sheets = swModel.GetSheetNames()
+            sheets = _com_call(swModel, "GetSheetNames")
             if sheets:
                 sheet_name = str(sheets[0])
         except Exception:
