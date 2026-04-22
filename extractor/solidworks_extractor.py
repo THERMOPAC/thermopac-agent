@@ -550,28 +550,91 @@ def _extract_custom_properties(swApp, swModel, logger) -> dict:
         logger.warning(f"[CP] Sheet-level failed: {e}")
 
     # 3. Model-level (first referenced part/assembly found in dependencies)
+    #
+    # SolidWorks COM ActivateDoc3 quirk:
+    #   In late-bind mode the open-document registry uses the *stem* (no extension)
+    #   as the internal key.  ActivateDoc3(full_path) and ActivateDoc3(basename)
+    #   both return None, but ActivateDoc3(stem) succeeds.
+    #   Debug logs from every job confirm: ActivateDoc3('Part1') → CDispatch.
+    #
+    # Approach:
+    #   Pass A — GetDocumentDependencies2 to find referenced .sldprt/.sldasm paths,
+    #             then try (full_path, basename, stem) for each.
+    #   Pass B — Scan all open documents via GetFirstDocument/GetNext (property-
+    #             style COM calls) filtering for part/assembly type.
+    #   Pass C — Infer stem from the drawing filename itself (drawing and part
+    #             often share the same base name, e.g. Part1.SLDDRW → Part1).
     try:
         model_doc = None
+
+        def _try_activate(name: str) -> object | None:
+            try:
+                err_v = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+                doc = swApp.ActivateDoc3(name, False, 0, err_v)
+                if doc is not None:
+                    logger.info(f"[CP] Model-level: ActivateDoc3({name!r}) → OK")
+                return doc
+            except Exception:
+                return None
+
+        # Pass A — dependency list
         try:
-            path = swModel.GetPathName()
-            deps = swApp.GetDocumentDependencies2(path, False, True, False) or []
+            drw_path = swModel.GetPathName() or ""
+            deps = swApp.GetDocumentDependencies2(drw_path, False, True, False) or []
             for dep in deps:
                 dep_str = str(dep or "")
-                if dep_str.lower().endswith((".sldprt", ".sldasm")):
-                    for try_name in (dep_str, os.path.basename(dep_str)):
-                        try:
-                            errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-                            candidate = swApp.ActivateDoc3(try_name, False, 0, errors)
-                            if candidate is not None:
-                                model_doc = candidate
-                                logger.info(f"[CP] Model-level: found referenced doc '{try_name}'")
-                                break
-                        except Exception:
-                            pass
+                if not dep_str.lower().endswith((".sldprt", ".sldasm")):
+                    continue
+                basename = os.path.basename(dep_str)
+                stem     = os.path.splitext(basename)[0]
+                for try_name in (dep_str, basename, stem):
+                    doc = _try_activate(try_name)
+                    if doc is not None:
+                        model_doc = doc
+                        break
                 if model_doc is not None:
                     break
         except Exception as dep_e:
-            logger.debug(f"[CP] GetDocumentDependencies2 for model: {dep_e}")
+            logger.debug(f"[CP] GetDocumentDependencies2 scan: {dep_e}")
+
+        # Pass B — scan open documents via GetFirstDocument → GetNext chain
+        if model_doc is None:
+            try:
+                doc = _com_call(swApp, "GetFirstDocument")
+                seen: set[int] = set()
+                while doc is not None:
+                    doc_id = id(doc)
+                    if doc_id in seen:
+                        break
+                    seen.add(doc_id)
+                    try:
+                        doc_type = doc.GetType()
+                        if doc_type in (1, 2):   # 1=Part, 2=Assembly
+                            logger.info(f"[CP] Model-level: open-doc scan found type={doc_type}")
+                            model_doc = doc
+                            break
+                    except Exception:
+                        pass
+                    try:
+                        doc = _com_call(doc, "GetNext")
+                    except Exception:
+                        break
+            except Exception as scan_e:
+                logger.debug(f"[CP] Open-doc scan: {scan_e}")
+
+        # Pass C — infer from drawing filename (Part1.SLDDRW → try 'Part1')
+        if model_doc is None:
+            try:
+                drw_path = swModel.GetPathName() or ""
+                drw_stem = os.path.splitext(os.path.basename(drw_path))[0]
+                if drw_stem:
+                    for try_name in (drw_stem, drw_stem + ".SLDPRT", drw_stem + ".SLDASM"):
+                        doc = _try_activate(try_name)
+                        if doc is not None:
+                            model_doc = doc
+                            break
+            except Exception as inf_e:
+                logger.debug(f"[CP] Infer-from-drawing-name: {inf_e}")
 
         if model_doc is not None:
             mgr = model_doc.Extension.CustomPropertyManager("")
