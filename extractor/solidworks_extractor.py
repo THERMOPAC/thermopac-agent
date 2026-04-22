@@ -81,16 +81,17 @@ except ImportError:
     WIN32GUI_AVAILABLE = False
 
 
-from extractor.extract_properties    import ExtractProperties
-from extractor.extract_sheets        import ExtractSheets
-from extractor.extract_views         import ExtractViews
-from extractor.extract_dimensions    import ExtractDimensions
-from extractor.extract_annotations   import ExtractAnnotations
-from extractor.extract_tables        import ExtractTables
-from extractor.extract_references    import ExtractReferences
-from extractor.extract_health        import ExtractHealth
-from extractor.extract_nozzles       import ExtractNozzles
-from extractor.extract_design_data   import ExtractDesignDataTable
+from extractor.extract_properties       import ExtractProperties
+from extractor.extract_sheets           import ExtractSheets
+from extractor.extract_views            import ExtractViews
+from extractor.extract_dimensions       import ExtractDimensions
+from extractor.extract_annotations      import ExtractAnnotations
+from extractor.extract_tables           import ExtractTables
+from extractor.extract_references       import ExtractReferences
+from extractor.extract_health           import ExtractHealth
+from extractor.extract_nozzles          import ExtractNozzles
+from extractor.extract_design_data      import ExtractDesignDataTable
+from extractor.verify_custom_properties import verify_custom_properties
 from extractor._com_helper import (
     cast_to_drawing_doc,
     com_type_summary,
@@ -647,20 +648,22 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         "references":         {},
         "health":             {},
         "nozzles":            {},
-        "design_data":        {},
-        "design_data_table":  {},
+        "design_data":                {},
+        "design_data_table":          {},
+        "customPropertyVerification": {},
         "extraction_warnings": [],
         "extraction_errors": {
-            "properties":        None,
-            "sheets":            None,
-            "views":             None,
-            "dimensions":        None,
-            "annotations":       None,
-            "tables":            None,
-            "references":        None,
-            "health":            None,
-            "nozzles":           None,
-            "design_data_table": None,
+            "properties":                 None,
+            "sheets":                     None,
+            "views":                      None,
+            "dimensions":                 None,
+            "annotations":               None,
+            "tables":                    None,
+            "references":                None,
+            "health":                    None,
+            "nozzles":                   None,
+            "design_data_table":         None,
+            "customPropertyVerification": None,
         },
     }
 
@@ -992,6 +995,22 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
             f"bom_found={result['extraction_summary']['bom_found']} "
             f"design_data={result['extraction_summary']['design_data_status']}:{result['extraction_summary']['design_data_source']}"
         )
+
+        # ── Layer 1: Custom Property Verification ──────────────────────────────
+        try:
+            cp_result = verify_custom_properties(
+                result.get("properties", {}).get("custom_properties", {}),
+                result.get("design_data_table", {}),
+                logger,
+            )
+            result.update(cp_result)
+            cp_status = result.get("customPropertyVerification", {}).get("status", "unknown")
+            logger.info(f"[Extractor] customPropertyVerification: status={cp_status}")
+        except Exception as e:
+            err_msg = f"{type(e).__name__}: {e}"
+            logger.error(f"[Extractor] customPropertyVerification SOFT FAIL: {err_msg}")
+            result["extraction_errors"]["customPropertyVerification"] = err_msg
+            result["extraction_warnings"].append(f"customPropertyVerification failed: {err_msg}")
 
         logger.info("[Extractor] All modules complete")
         return result
