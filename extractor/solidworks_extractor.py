@@ -431,15 +431,30 @@ def _read_cpm(mgr, source_label: str, logger) -> dict[str, str]:
         result: dict[str, str] = {}
         for name in names:
             try:
-                # Get5: (retval, val, resolvedVal, wasResolved, linkToProp)
-                # In late-bound mode Get5 may not exist; fall back to Get4 / Get2
+                # SolidWorks ICustomPropertyManager out-param return order
+                # (Python win32com strips HRESULT; only out-params are returned):
+                #   Get5(name, useCached) → (val, resolvedVal, wasResolved, linkToPropVar)
+                #   Get4(name, useCached) → (val, resolvedVal, wasResolved)
+                #   Get2(name, useCached) → (val, resolvedVal)
+                # resolvedVal (expanded value) is always at index 1.
+                # val (unexpanded, e.g. "$PRPWLD:…") is at index 0 as fallback.
                 resolved = ""
-                for api, idx in (("Get5", 2), ("Get4", 2), ("Get2", 1)):
+                for api in ("Get5", "Get4", "Get2"):
                     try:
                         ret = getattr(mgr, api)(name, False)
-                        if isinstance(ret, (list, tuple)) and len(ret) > idx:
-                            resolved = str(ret[idx]).strip()
-                        break
+                        if isinstance(ret, str):
+                            # Rare: late-bound returns scalar string directly
+                            resolved = ret.strip()
+                            break
+                        if isinstance(ret, (list, tuple)):
+                            # Try resolvedVal (idx 1) first; fall back to val (idx 0)
+                            for idx in (1, 0):
+                                if len(ret) > idx:
+                                    candidate = str(ret[idx]).strip()
+                                    if candidate:
+                                        resolved = candidate
+                                        break
+                        break   # stop trying further APIs once one succeeds
                     except Exception:
                         continue
                 result[name] = resolved
@@ -1054,8 +1069,32 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
             cp_extraction = _extract_custom_properties(swApp, swModel, logger)
             cp_result = verify_custom_properties(cp_extraction, logger)
             result.update(cp_result)
+
+            # ── Populate `properties` from all three extraction sources ──────
+            by_src = cp_extraction.get("bySource", {})
+            result["properties"] = {
+                "drawing":  by_src.get("drawing", {}),
+                "sheet":    by_src.get("sheet",   {}),
+                "model":    by_src.get("model",   {}),
+                "resolved": cp_extraction.get("resolved", {}),
+            }
+
+            # ── Populate `extraction_summary` ────────────────────────────────
+            total_target = len(_TARGET_PROPERTIES)
+            total_found  = cp_extraction.get("totalFound", 0)
+            result["extraction_summary"] = {
+                "target_properties_total": total_target,
+                "target_properties_found": total_found,
+                "missing_count":           total_target - total_found,
+                "source_summary": {
+                    "drawing": len(by_src.get("drawing", {})),
+                    "sheet":   len(by_src.get("sheet",   {})),
+                    "model":   len(by_src.get("model",   {})),
+                },
+            }
+
             cp_status = result.get("customPropertyVerification", {}).get("status", "unknown")
-            eq_cfg = result.get("customPropertyVerification", {}).get("equipmentConfig", "")
+            eq_cfg    = result.get("customPropertyVerification", {}).get("equipmentConfig", "")
             logger.info(
                 f"[Extractor] customPropertyVerification: status={cp_status} equipmentConfig={eq_cfg!r}"
             )

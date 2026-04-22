@@ -105,6 +105,7 @@ def run_job(job: dict, client: JobClient, config, logger) -> None:
         }
 
         # ── 5. Upload ─────────────────────────────────────────────────────────
+        _debug_payload(extraction_result, job_id, logger)
         logger.info(f"[Runner] Uploading extraction result for job {job_id}…")
         success = client.complete_job(job_id, extraction_result)
         if not success:
@@ -149,3 +150,21 @@ def _sha256(path: str) -> str:
 def _machine_name() -> str:
     import socket
     return socket.gethostname()
+
+
+def _debug_payload(payload: dict, job_id: int, logger) -> None:
+    """Log a one-line summary of the final payload before upload."""
+    keys = list(payload.keys())
+    props_val      = payload.get("properties")
+    cpv_val        = payload.get("customPropertyVerification")
+    summary_val    = payload.get("extraction_summary")
+    props_status   = "object" if isinstance(props_val, dict) else ("null" if props_val is None else type(props_val).__name__)
+    cpv_status     = "object" if isinstance(cpv_val,   dict) else ("null" if cpv_val   is None else type(cpv_val).__name__)
+    summary_status = "object" if isinstance(summary_val, dict) else ("null" if summary_val is None else type(summary_val).__name__)
+    logger.info(
+        f"[Runner] Pre-upload payload job {job_id}: "
+        f"keys={keys} | "
+        f"properties={props_status} | "
+        f"customPropertyVerification={cpv_status} | "
+        f"extraction_summary={summary_status}"
+    )
