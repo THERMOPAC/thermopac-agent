@@ -552,96 +552,131 @@ def _extract_custom_properties(swApp, swModel, logger) -> dict:
     # 3. Model-level (first referenced part/assembly found in dependencies)
     #
     # SolidWorks COM ActivateDoc3 quirk:
-    #   In late-bind mode the open-document registry uses the *stem* (no extension)
-    #   as the internal key.  ActivateDoc3(full_path) and ActivateDoc3(basename)
-    #   both return None, but ActivateDoc3(stem) succeeds.
-    #   Debug logs from every job confirm: ActivateDoc3('Part1') → CDispatch.
+    #   ActivateDoc3 quirk in late-bind mode:
+    #     ActivateDoc3 uses the document *stem* as its key.  When a drawing
+    #     (Part1.SLDDRW) and a part (Part1.SLDPRT) share the same stem, the
+    #     DRAWING is returned because it is the currently active document.
+    #     We must verify the returned doc type is Part(1) or Assembly(2),
+    #     never Drawing(3).
     #
-    # Approach:
-    #   Pass A — GetDocumentDependencies2 to find referenced .sldprt/.sldasm paths,
-    #             then try (full_path, basename, stem) for each.
-    #   Pass B — Scan all open documents via GetFirstDocument/GetNext (property-
-    #             style COM calls) filtering for part/assembly type.
-    #   Pass C — Infer stem from the drawing filename itself (drawing and part
-    #             often share the same base name, e.g. Part1.SLDDRW → Part1).
+    # Primary strategy — navigate via drawing VIEWS:
+    #     swModel.GetViews() (confirmed working in all job logs) returns
+    #     sheet-view tuples.  view.ReferencedDocument directly returns the
+    #     referenced Part/Assembly document — no path ambiguity, no stem clash.
+    #
+    # Fallback strategies:
+    #   A — GetDocumentDependencies2 → ActivateDoc3(full, base, stem) with type check
+    #   B — GetFirstDocument/GetNext chain with type check
+    #   C — Try activating the dep path directly via GetDocumentDependencies2
+    #       result, verifying type == 1 or 2
     try:
         model_doc = None
 
-        def _try_activate(name: str) -> object | None:
+        def _is_part_or_asm(doc) -> bool:
+            """Return True only if doc is a Part or Assembly (not a Drawing)."""
+            try:
+                t = doc.GetType()
+                return t in (1, 2)   # 1=Part, 2=Assembly
+            except Exception:
+                return False
+
+        def _try_activate_part(name: str) -> object | None:
+            """Activate by name; return doc only if it is a Part or Assembly."""
             try:
                 err_v = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
                 doc = swApp.ActivateDoc3(name, False, 0, err_v)
-                if doc is not None:
-                    logger.info(f"[CP] Model-level: ActivateDoc3({name!r}) → OK")
-                return doc
+                if doc is not None and _is_part_or_asm(doc):
+                    return doc
+                return None
             except Exception:
                 return None
 
-        # Pass A — dependency list
+        # Pass 1 — traverse drawing views to reach ReferencedDocument
+        # Confirmed working: GetViews returns ((<PyIDispatch ...>,),)
         try:
-            drw_path = swModel.GetPathName() or ""
-            deps = swApp.GetDocumentDependencies2(drw_path, False, True, False) or []
-            for dep in deps:
-                dep_str = str(dep or "")
-                if not dep_str.lower().endswith((".sldprt", ".sldasm")):
-                    continue
-                basename = os.path.basename(dep_str)
-                stem     = os.path.splitext(basename)[0]
-                for try_name in (dep_str, basename, stem):
-                    doc = _try_activate(try_name)
-                    if doc is not None:
-                        model_doc = doc
+            views_result = _com_call(swModel, "GetViews")
+            if views_result and isinstance(views_result, (list, tuple)):
+                for sheet_entry in views_result:
+                    if sheet_entry is None:
+                        continue
+                    view_list = sheet_entry if isinstance(sheet_entry, (list, tuple)) else [sheet_entry]
+                    for view in view_list:
+                        if view is None:
+                            continue
+                        try:
+                            ref_doc = view.ReferencedDocument
+                            if ref_doc is not None and _is_part_or_asm(ref_doc):
+                                model_doc = ref_doc
+                                try:
+                                    ref_path = ref_doc.GetPathName()
+                                except Exception:
+                                    ref_path = "(unknown)"
+                                logger.info(
+                                    f"[CP] Model-level Pass1: view.ReferencedDocument → {ref_path!r}"
+                                )
+                                break
+                        except Exception as ve:
+                            logger.debug(f"[CP] view.ReferencedDocument: {ve}")
+                    if model_doc is not None:
                         break
-                if model_doc is not None:
-                    break
-        except Exception as dep_e:
-            logger.debug(f"[CP] GetDocumentDependencies2 scan: {dep_e}")
+        except Exception as vp_e:
+            logger.debug(f"[CP] Pass1 GetViews traversal: {vp_e}")
 
-        # Pass B — scan open documents via GetFirstDocument → GetNext chain
+        # Pass 2 — GetDocumentDependencies2 → ActivateDoc3 with type check
+        if model_doc is None:
+            try:
+                drw_path = swModel.GetPathName() or ""
+                deps = swApp.GetDocumentDependencies2(drw_path, False, True, False) or []
+                for dep in deps:
+                    dep_str = str(dep or "")
+                    if not dep_str.lower().endswith((".sldprt", ".sldasm")):
+                        continue
+                    basename = os.path.basename(dep_str)
+                    stem     = os.path.splitext(basename)[0]
+                    for try_name in (dep_str, basename, stem):
+                        doc = _try_activate_part(try_name)
+                        if doc is not None:
+                            model_doc = doc
+                            logger.info(f"[CP] Model-level Pass2: ActivateDoc3({try_name!r}) → Part/Asm")
+                            break
+                    if model_doc is not None:
+                        break
+            except Exception as dep_e:
+                logger.debug(f"[CP] Pass2 GetDocumentDependencies2: {dep_e}")
+
+        # Pass 3 — walk GetFirstDocument → GetNext chain, pick first Part/Asm
         if model_doc is None:
             try:
                 doc = _com_call(swApp, "GetFirstDocument")
                 seen: set[int] = set()
-                while doc is not None:
+                iters = 0
+                while doc is not None and iters < 20:
+                    iters += 1
                     doc_id = id(doc)
                     if doc_id in seen:
                         break
                     seen.add(doc_id)
-                    try:
-                        doc_type = doc.GetType()
-                        if doc_type in (1, 2):   # 1=Part, 2=Assembly
-                            logger.info(f"[CP] Model-level: open-doc scan found type={doc_type}")
-                            model_doc = doc
-                            break
-                    except Exception:
-                        pass
+                    if _is_part_or_asm(doc):
+                        model_doc = doc
+                        try:
+                            p = doc.GetPathName()
+                        except Exception:
+                            p = "(unknown)"
+                        logger.info(f"[CP] Model-level Pass3: open-doc scan found Part/Asm {p!r}")
+                        break
                     try:
                         doc = _com_call(doc, "GetNext")
                     except Exception:
                         break
             except Exception as scan_e:
-                logger.debug(f"[CP] Open-doc scan: {scan_e}")
-
-        # Pass C — infer from drawing filename (Part1.SLDDRW → try 'Part1')
-        if model_doc is None:
-            try:
-                drw_path = swModel.GetPathName() or ""
-                drw_stem = os.path.splitext(os.path.basename(drw_path))[0]
-                if drw_stem:
-                    for try_name in (drw_stem, drw_stem + ".SLDPRT", drw_stem + ".SLDASM"):
-                        doc = _try_activate(try_name)
-                        if doc is not None:
-                            model_doc = doc
-                            break
-            except Exception as inf_e:
-                logger.debug(f"[CP] Infer-from-drawing-name: {inf_e}")
+                logger.debug(f"[CP] Pass3 open-doc scan: {scan_e}")
 
         if model_doc is not None:
             mgr = model_doc.Extension.CustomPropertyManager("")
             by_source["model"] = _read_cpm(mgr, "model", logger)
             all_detected["model"] = list(by_source["model"].keys())
         else:
-            logger.info("[CP] Model-level: no referenced model document accessible")
+            logger.info("[CP] Model-level: no referenced model document accessible (all passes failed)")
     except Exception as e:
         logger.warning(f"[CP] Model-level failed: {e}")
 
