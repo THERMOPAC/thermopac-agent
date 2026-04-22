@@ -505,7 +505,9 @@ def _read_cpm(mgr, source_label: str, logger) -> dict[str, str]:
         return {}
 
 
-def _extract_custom_properties(swApp, swModel, logger, preopen_diags: dict | None = None) -> dict:
+def _extract_custom_properties(swApp, swModel, logger,
+                               preopen_diags: dict | None = None,
+                               temp_path: str = "") -> dict:
     """
     Extract target custom properties from three sources (priority order):
       1. Drawing-level  — CustomPropertyManager("")
@@ -657,29 +659,40 @@ def _extract_custom_properties(swApp, swModel, logger, preopen_diags: dict | Non
             logger.warning(f"[CP] Pass1 GetViews traversal failed: {vp_e}")
 
         # ─── Pass 2 ──────────────────────────────────────────────────────────
-        # GetDocumentDependencies2 → ActivateDoc3(full_path, basename, stem)
-        if model_doc is None:
+        # GetDocumentDependencies2(temp_path) → GetOpenDocumentByName per dep.
+        # Uses temp_path directly to avoid swModel.GetPathName() which fails in
+        # late-bind (it's a property, not a method — calling it() raises
+        # 'str object is not callable').  Also uses GetOpenDocumentByName
+        # instead of ActivateDoc3 because the latter returns None even for
+        # documents that are already loaded.
+        if model_doc is None and temp_path:
             try:
-                drw_path = swModel.GetPathName() or ""
-                deps = swApp.GetDocumentDependencies2(drw_path, False, True, False) or []
-                logger.info(f"[CP] Pass2 GetDocumentDependencies2('{drw_path}'): {len(deps)} entries")
+                deps = swApp.GetDocumentDependencies2(temp_path, False, True, False) or []
+                logger.info(f"[CP] Pass2 GetDocumentDependencies2({temp_path!r}): {len(deps)} entries")
                 for dep in deps:
                     dep_str = str(dep or "")
                     if not dep_str.lower().endswith((".sldprt", ".sldasm")):
                         continue
                     basename = os.path.basename(dep_str)
-                    stem     = os.path.splitext(basename)[0]
-                    logger.info(f"[CP] Pass2 dep={dep_str!r} → trying (full, base, stem)")
-                    for try_name in (dep_str, basename, stem):
-                        doc = _try_activate_part(try_name)
-                        if doc is not None:
-                            model_doc = doc
-                            logger.info(f"[CP] Model-level Pass2 ✓ ActivateDoc3({try_name!r}) → Part/Asm")
-                            break
+                    logger.info(f"[CP] Pass2 dep={dep_str!r} → GetOpenDocumentByName(full, base)")
+                    for try_name in (dep_str, basename):
+                        try:
+                            raw = swApp.GetOpenDocumentByName(try_name)
+                            doc = _disp(raw)
+                            if doc is not None and _is_part_or_asm(doc):
+                                model_doc = doc
+                                logger.info(f"[CP] Model-level Pass2 ✓ GetOpenDocumentByName({try_name!r}) → Part/Asm")
+                                break
+                            elif raw is not None:
+                                logger.warning(f"[CP] Pass2 GetOpenDocumentByName({try_name!r}) → {type(raw).__name__} (not Part/Asm)")
+                            else:
+                                logger.info(f"[CP] Pass2 GetOpenDocumentByName({try_name!r}) → None")
+                        except Exception as e:
+                            logger.warning(f"[CP] Pass2 GetOpenDocumentByName({try_name!r}): {e}")
                     if model_doc is not None:
                         break
                 if model_doc is None:
-                    logger.warning("[CP] Pass2: no Part/Asm found via ActivateDoc3")
+                    logger.warning("[CP] Pass2: no Part/Asm found via GetOpenDocumentByName")
             except Exception as dep_e:
                 logger.warning(f"[CP] Pass2 GetDocumentDependencies2: {dep_e}")
 
@@ -1282,7 +1295,7 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         # ── Layer 1: Custom property extraction + verification ─────────────────
         _check_cancel(cancel_event, "before custom property extraction")
         try:
-            cp_extraction = _extract_custom_properties(swApp, swModel, logger, preopen_diagnostics)
+            cp_extraction = _extract_custom_properties(swApp, swModel, logger, preopen_diagnostics, temp_path)
             cp_result = verify_custom_properties(cp_extraction, logger)
             result.update(cp_result)
 
