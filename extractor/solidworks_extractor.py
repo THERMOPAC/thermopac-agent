@@ -588,16 +588,30 @@ def _extract_custom_properties(swApp, swModel, logger,
                 return None
 
         def _is_part_or_asm(doc) -> bool:
-            """Return True only if doc is a Part(1) or Assembly(2), not Drawing(3)."""
+            """Return True only if doc is a Part(1) or Assembly(2), not Drawing(3).
+
+            In late-bind COM, GetType may be a non-callable property that returns
+            an int directly.  doc.GetType() would then try to call that int →
+            'int is not callable'.  _com_call handles both property and method
+            forms by checking callable() first.
+            """
             try:
-                t = _disp(doc).GetType()
+                d = _disp(doc)
+                if d is None:
+                    return False
+                t = _com_call(d, "GetType")
+                logger.debug(f"[CP] _is_part_or_asm: GetType()={t!r}")
                 return t in (1, 2)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"[CP] _is_part_or_asm GetType failed: {e}")
                 return False
 
         def _safe_path(doc) -> str:
             try:
-                return _disp(doc).GetPathName() or "(no path)"
+                d = _disp(doc)
+                if d is None:
+                    return "(no doc)"
+                return _com_call(d, "GetPathName") or "(no path)"
             except Exception:
                 return "(unknown)"
 
