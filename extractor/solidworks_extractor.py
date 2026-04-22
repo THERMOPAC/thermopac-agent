@@ -505,7 +505,7 @@ def _read_cpm(mgr, source_label: str, logger) -> dict[str, str]:
         return {}
 
 
-def _extract_custom_properties(swApp, swModel, logger) -> dict:
+def _extract_custom_properties(swApp, swModel, logger, preopen_diags: dict | None = None) -> dict:
     """
     Extract target custom properties from three sources (priority order):
       1. Drawing-level  — CustomPropertyManager("")
@@ -718,6 +718,40 @@ def _extract_custom_properties(swApp, swModel, logger) -> dict:
                     logger.warning(f"[CP] Pass3: scanned {iters} doc(s), no Part/Asm found")
             except Exception as scan_e:
                 logger.warning(f"[CP] Pass3 open-doc scan: {scan_e}")
+
+        # ─── Pass 4 ──────────────────────────────────────────────────────────
+        # GetOpenDocumentByName with paths from the pre-open dependency scan.
+        # This API is confirmed working BEFORE the drawing opens; try it again
+        # here in case it still resolves the already-open part after opening
+        # the drawing.  This avoids all ReferencedDocument / GetFirstDocument
+        # COM issues entirely.
+        if model_doc is None:
+            open_items = (preopen_diags or {}).get("already_open", []) or []
+            logger.info(f"[CP] Pass4: checking {len(open_items)} pre-open dependency path(s) via GetOpenDocumentByName")
+            for item in open_items:
+                dep_path = item.get("dependency_path", "")
+                if not dep_path:
+                    continue
+                if not dep_path.lower().endswith((".sldprt", ".sldasm")):
+                    continue
+                for try_name in (dep_path, os.path.basename(dep_path)):
+                    try:
+                        raw = swApp.GetOpenDocumentByName(try_name)
+                        doc = _disp(raw)
+                        if doc is not None and _is_part_or_asm(doc):
+                            model_doc = doc
+                            logger.info(f"[CP] Model-level Pass4 ✓ GetOpenDocumentByName({try_name!r}) → Part/Asm")
+                            break
+                        elif raw is not None:
+                            logger.warning(f"[CP] Pass4 GetOpenDocumentByName({try_name!r}) → {type(raw).__name__} (not Part/Asm)")
+                        else:
+                            logger.info(f"[CP] Pass4 GetOpenDocumentByName({try_name!r}) → None")
+                    except Exception as e:
+                        logger.warning(f"[CP] Pass4 GetOpenDocumentByName({try_name!r}): {e}")
+                if model_doc is not None:
+                    break
+            if model_doc is None and open_items:
+                logger.warning("[CP] Pass4: GetOpenDocumentByName returned None for all known part paths")
 
         if model_doc is not None:
             mgr = model_doc.Extension.CustomPropertyManager("")
@@ -1248,7 +1282,7 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         # ── Layer 1: Custom property extraction + verification ─────────────────
         _check_cancel(cancel_event, "before custom property extraction")
         try:
-            cp_extraction = _extract_custom_properties(swApp, swModel, logger)
+            cp_extraction = _extract_custom_properties(swApp, swModel, logger, preopen_diagnostics)
             cp_result = verify_custom_properties(cp_extraction, logger)
             result.update(cp_result)
 
