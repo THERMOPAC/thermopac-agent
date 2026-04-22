@@ -423,11 +423,29 @@ def _com_call(obj, method: str, *args):
 
 
 def _read_cpm(mgr, source_label: str, logger) -> dict[str, str]:
-    """Read all properties from a CustomPropertyManager; return name→value dict."""
+    """
+    Read all properties from a CustomPropertyManager; return name→value dict.
+
+    useCached strategy
+    ------------------
+    SolidWorks custom property values can be literal strings or expressions like
+    "$PRPWLD:Design_Code" that resolve by looking up a linked model property.
+    When the drawing is opened without its referenced part (ExternalRefsNotLoaded),
+    Get5(..., useCached=False) forces live re-evaluation → the expression cannot
+    be resolved → returns "".
+
+    Correct approach: try useCached=True first (returns the value that was
+    cached/resolved at last save — the same value that displays in the title
+    block and in the Property Tab).  Only fall back to useCached=False if True
+    returns nothing, in case the property is a freshly-added literal with no
+    prior cached state.
+    """
     try:
         names = _com_call(mgr, "GetNames")
         if not names:
+            logger.info(f"[CP] {source_label}: CustomPropertyManager returned no names")
             return {}
+
         result: dict[str, str] = {}
         for name in names:
             try:
@@ -436,33 +454,51 @@ def _read_cpm(mgr, source_label: str, logger) -> dict[str, str]:
                 #   Get5(name, useCached) → (val, resolvedVal, wasResolved, linkToPropVar)
                 #   Get4(name, useCached) → (val, resolvedVal, wasResolved)
                 #   Get2(name, useCached) → (val, resolvedVal)
-                # resolvedVal (expanded value) is always at index 1.
-                # val (unexpanded, e.g. "$PRPWLD:…") is at index 0 as fallback.
-                resolved = ""
+                # resolvedVal (expanded/resolved value) is at index 1.
+                # val (raw, possibly "$PRPWLD:…") is at index 0 as last resort.
+                value = ""
+                winning_call = ""
                 for api in ("Get5", "Get4", "Get2"):
-                    try:
-                        ret = getattr(mgr, api)(name, False)
-                        if isinstance(ret, str):
-                            # Rare: late-bound returns scalar string directly
-                            resolved = ret.strip()
-                            break
-                        if isinstance(ret, (list, tuple)):
-                            # Try resolvedVal (idx 1) first; fall back to val (idx 0)
-                            for idx in (1, 0):
-                                if len(ret) > idx:
-                                    candidate = str(ret[idx]).strip()
-                                    if candidate:
-                                        resolved = candidate
-                                        break
-                        break   # stop trying further APIs once one succeeds
-                    except Exception:
-                        continue
-                result[name] = resolved
+                    for use_cached in (True, False):
+                        try:
+                            ret = getattr(mgr, api)(name, use_cached)
+                            candidate = ""
+                            if isinstance(ret, str):
+                                candidate = ret.strip()
+                            elif isinstance(ret, (list, tuple)):
+                                for idx in (1, 0):
+                                    if len(ret) > idx:
+                                        c = str(ret[idx]).strip()
+                                        if c:
+                                            candidate = c
+                                            break
+                            if candidate:
+                                value = candidate
+                                winning_call = f"{api}(useCached={use_cached})"
+                                break   # found a value — stop trying useCached variants
+                        except Exception:
+                            continue
+                    if value:
+                        break           # found a value — stop trying further APIs
+                result[name] = value
+                logger.debug(
+                    f"[CP] {source_label}  {name!r} = {value!r}"
+                    + (f"  via {winning_call}" if winning_call else "  (empty)")
+                )
             except Exception as ex:
                 logger.debug(f"[CP] {source_label}: cannot read '{name}': {ex}")
+
+        # Log summary with actual values for target properties
+        found_count = sum(1 for v in result.values() if v)
         logger.info(
-            f"[CP] {source_label}: {len(result)} properties detected: {list(result.keys())}"
+            f"[CP] {source_label}: {len(result)} properties detected "
+            f"({found_count} with values): {list(result.keys())}"
         )
+        for name, val in result.items():
+            if val:
+                logger.info(f"[CP] {source_label}  {name} = {val!r}")
+            else:
+                logger.debug(f"[CP] {source_label}  {name} = (empty)")
         return result
     except Exception as e:
         logger.warning(f"[CP] {source_label}: GetNames failed: {e}")
