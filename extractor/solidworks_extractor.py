@@ -447,26 +447,81 @@ def _read_cpm(mgr, source_label: str, logger, probe_names=None) -> dict[str, str
     and probe_names is supplied, we directly call Get4/Get5 for each known name
     to bypass the enumeration failure.
     """
+    def _pick_value(ret):
+        """
+        Extract the best non-empty string from a COM return value.
+        In SolidWorks Get4/Get5/Get6 the tuple order is:
+          (raw_expr, resolved_val, wasResolved[, linkToProp])
+        We prefer resolved_val (idx 1) over raw_expr (idx 0), but skip
+        $PRPWLD / $PRP expressions unless nothing else is available.
+        """
+        if ret is None:
+            return ""
+        if isinstance(ret, str):
+            v = ret.strip()
+            return "" if v.startswith("$") else v
+        if isinstance(ret, (list, tuple)) and len(ret) > 0:
+            # Try indices in preference order: resolved first (1), then raw (0)
+            best = ""
+            for idx in (1, 0):
+                if len(ret) > idx:
+                    v = str(ret[idx]).strip()
+                    if v and not v.startswith("$"):
+                        return v
+                    if v and not best:
+                        best = v     # keep raw expression as last resort
+            return best
+        return ""
+
     def _extract_one(mgr, name):
-        """Try Get5/Get4/Get2 with useCached=True then False; return (value, winning_call)."""
-        for api in ("Get5", "Get4", "Get2"):
+        """
+        Try multiple SolidWorks Get* APIs to read one custom property value.
+
+        win32com late-bind note: without type-library, ByRef out-params are NOT
+        automatically marshalled back.  The workaround is to pass placeholder
+        values for every ByRef param — win32com then includes the modified values
+        in the return tuple.  We try both styles (with and without placeholders).
+
+        API hierarchy (newest → oldest):
+          Get6(name, useCached, val, resolvedVal, wasResolved, linkToProp) → int
+          Get5(name, useCached, val, resolvedVal, wasResolved)             → int
+          Get4(name, useCached, val, resolvedVal)                         → int
+          Get2(name, useCached, val, resolvedVal)                         → int  (identical to Get4 signature in SW2019)
+        resolvedVal is always index 1 of the returned tuple.
+        """
+        # ── Strategy A: pass ByRef placeholder args ──────────────────────────
+        # When win32com gets explicit args for ByRef params, it passes them as
+        # VT_BYREF variants and returns the updated values in a tuple.
+        byref_calls = [
+            ("Get6", (name, False, "", "", False, False)),
+            ("Get6", (name, True,  "", "", False, False)),
+            ("Get5", (name, False, "", "", False)),
+            ("Get5", (name, True,  "", "", False)),
+            ("Get4", (name, False, "", "")),
+            ("Get4", (name, True,  "", "")),
+            ("Get2", (name, False, "")),
+            ("Get2", (name, True,  "")),
+        ]
+        for api, args in byref_calls:
+            try:
+                ret = getattr(mgr, api)(*args)
+                v = _pick_value(ret)
+                if v:
+                    return v, f"{api}(byref,uc={args[1]})"
+            except Exception:
+                continue
+
+        # ── Strategy B: no extra args (original approach) ─────────────────────
+        for api in ("Get6", "Get5", "Get4", "Get2"):
             for use_cached in (True, False):
                 try:
                     ret = getattr(mgr, api)(name, use_cached)
-                    candidate = ""
-                    if isinstance(ret, str):
-                        candidate = ret.strip()
-                    elif isinstance(ret, (list, tuple)):
-                        for idx in (1, 0):
-                            if len(ret) > idx:
-                                c = str(ret[idx]).strip()
-                                if c:
-                                    candidate = c
-                                    break
-                    if candidate:
-                        return candidate, f"{api}(useCached={use_cached})"
+                    v = _pick_value(ret)
+                    if v:
+                        return v, f"{api}(nobyref,uc={use_cached})"
                 except Exception:
                     continue
+
         return "", ""
 
     try:
@@ -482,11 +537,41 @@ def _read_cpm(mgr, source_label: str, logger, probe_names=None) -> dict[str, str
                 f"[CP] {source_label}: CustomPropertyManager returned no names "
                 f"(Count={count})"
             )
+            # ── Fallback A: GetAll3 bulk read ────────────────────────────────
+            # GetAll3 returns (names_array, types_array, values_array,
+            # resolvedValues_array).  Array out-params survive late-bind better
+            # than scalar ByRef strings.
+            try:
+                bulk = mgr.GetAll3()
+                if isinstance(bulk, (list, tuple)) and len(bulk) >= 4:
+                    b_names  = bulk[0] or ()
+                    b_vals   = bulk[2] or ()
+                    b_rvals  = bulk[3] or ()
+                    if b_names:
+                        logger.info(
+                            f"[CP] {source_label}: GetAll3 found {len(b_names)} names"
+                        )
+                        result: dict[str, str] = {}
+                        for i, n in enumerate(b_names):
+                            rv = (b_rvals[i] if i < len(b_rvals) else "").strip()
+                            ev = (b_vals[i]  if i < len(b_vals)  else "").strip()
+                            val = rv if (rv and not rv.startswith("$")) else (
+                                  ev if (ev and not ev.startswith("$")) else "")
+                            result[str(n)] = val
+                        found = sum(1 for v in result.values() if v)
+                        logger.info(
+                            f"[CP] {source_label}: GetAll3 → {len(result)} props "
+                            f"({found} with values)"
+                        )
+                        return result
+            except Exception as ge:
+                logger.debug(f"[CP] {source_label}: GetAll3 fallback: {ge}")
+
             if not probe_names:
                 return {}
-            # Direct probe: GetNames failed but we know what to look for.
-            # Call Get4(name, True) by name for each target property — this works
-            # even when the SAFEARRAY enumeration path is broken in late-bind COM.
+            # ── Fallback B: direct probe of known target names ────────────────
+            # Call Get6/Get4/Get2 with ByRef placeholders directly for each
+            # target property name — bypasses SAFEARRAY enumeration entirely.
             logger.info(
                 f"[CP] {source_label}: direct-probing {len(probe_names)} known property names"
             )
@@ -559,19 +644,32 @@ def _extract_custom_properties(swApp, swModel, logger,
         mgr = swModel.Extension.CustomPropertyManager("")
         by_source["drawing"] = _read_cpm(mgr, "drawing", logger)
         all_detected["drawing"] = list(by_source["drawing"].keys())
-        # Raw diagnostic: log both the expression string (val) AND resolved value
-        # for the first 5 target properties to confirm whether cache is populated.
-        diag_props = [p for p in _TARGET_PROPERTIES if p in by_source["drawing"]][:5]
+        # Raw diagnostic: show exactly what each Get* API returns for the first
+        # target property that exists in the drawing, using both calling styles.
+        diag_props = [p for p in _TARGET_PROPERTIES if p in by_source["drawing"]][:3]
         for dp in diag_props:
-            for api in ("Get5", "Get4", "Get2"):
+            for api, args in [
+                ("Get6", (dp, False, "", "", False, False)),
+                ("Get6", (dp, False)),
+                ("Get5", (dp, False, "", "", False)),
+                ("Get5", (dp, False)),
+                ("Get4", (dp, False, "", "")),
+                ("Get4", (dp, False)),
+                ("Get2", (dp, False, "")),
+                ("Get2", (dp, False)),
+            ]:
                 try:
-                    ret = getattr(mgr, api)(dp, True)
+                    ret = getattr(mgr, api)(*args)
                     logger.info(
-                        f"[CPRaw] drawing CPM {api}({dp!r}, useCached=True) → {ret!r}"
+                        f"[CPRaw] drawing CPM {api}({dp!r}, args={args[1:]}) "
+                        f"→ type={type(ret).__name__} val={ret!r}"
                     )
-                    break
-                except Exception:
-                    continue
+                    break  # one successful call per property is enough
+                except Exception as e:
+                    logger.info(
+                        f"[CPRaw] drawing CPM {api}({dp!r}, args={args[1:]}) "
+                        f"→ EXCEPTION: {e}"
+                    )
     except Exception as e:
         logger.warning(f"[CP] Drawing-level CustomPropertyManager failed: {e}")
 
