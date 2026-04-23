@@ -10,9 +10,10 @@
 ;   - dist\ThermopacAgent\  folder built by build-installer.bat
 ;   - dist\python\          Python 3.11 embeddable (downloaded by build-installer.bat)
 
-#define AppName      "ThermopacAgent Dev"
-#define AppVersion   "1.0.68"
-#define AppPublisher "Thermopac"
+#define AppName             "ThermopacAgent Dev"
+#define AppVersion          "1.0.69"
+#define AppPublisher        "Thermopac"
+#define DesktopShortcutName "SolidWorks Extraction Agent"
 #define AppURL       "https://5d05ae61-8225-4651-bb76-b4e20a4ddabb-00-3mex6zlihlmft.janeway.replit.dev"
 #define AppExeName   "run.bat"
 ; SourcePath is an InnoSetup built-in: the directory containing this .iss file
@@ -46,8 +47,9 @@ UninstallDisplayName={#AppName}
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon";      Description: "Create a &desktop shortcut";               GroupDescription: "Additional icons:"; Flags: unchecked
-Name: "startupschedule";  Description: "Start agent automatically at &Windows login"; GroupDescription: "Auto-start:";       Flags: unchecked
+Name: "desktopicon";      Description: "Create a &desktop shortcut";               GroupDescription: "Additional icons:"
+Name: "startmenuicon";    Description: "Create a &Start Menu shortcut";            GroupDescription: "Additional icons:"
+Name: "startupschedule";  Description: "Start agent automatically at &Windows login"; GroupDescription: "Auto-start:"; Flags: unchecked
 
 [Files]
 ; Agent EXE + supporting files (PyInstaller output)
@@ -72,11 +74,15 @@ Name: "{commonappdata}\ThermopacAgentDev\logs";   Permissions: everyone-full
 Name: "{commonappdata}\ThermopacAgentDev\config"; Permissions: everyone-full
 
 [Icons]
-Name: "{group}\{#AppName}";             Filename: "{app}\run.bat";       WorkingDir: "{app}"
-Name: "{group}\Edit Config";            Filename: "notepad.exe";         Parameters: """{app}\config.ini"""
-Name: "{group}\Repair COM Cache";       Filename: "{app}\makepy-repair.bat"; WorkingDir: "{app}"
-Name: "{group}\Uninstall {#AppName}";   Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppName}";       Filename: "{app}\run.bat";       WorkingDir: "{app}"; Tasks: desktopicon
+; Start Menu group entries (always created)
+Name: "{group}\{#AppName}";                  Filename: "{app}\run.bat";           WorkingDir: "{app}"
+Name: "{group}\Edit Config";                 Filename: "notepad.exe";             Parameters: """{app}\config.ini"""
+Name: "{group}\Repair COM Cache";            Filename: "{app}\makepy-repair.bat"; WorkingDir: "{app}"
+Name: "{group}\Uninstall {#AppName}";        Filename: "{uninstallexe}"
+; Named Start Menu shortcut (task-controlled, checked by default)
+Name: "{group}\{#DesktopShortcutName}";      Filename: "{app}\run.bat";           WorkingDir: "{app}"; Tasks: startmenuicon
+; Desktop shortcut (task-controlled, checked by default)
+Name: "{autodesktop}\{#DesktopShortcutName}"; Filename: "{app}\run.bat";          WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\run.bat"; Description: "Launch {#AppName} now"; Flags: nowait postinstall skipifsilent unchecked shellexec

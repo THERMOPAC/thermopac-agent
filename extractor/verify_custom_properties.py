@@ -1,7 +1,7 @@
 """
 verify_custom_properties.py — Layer 1: Custom Property Verification
 
-Validates the 21 target custom properties extracted from a SolidWorks drawing.
+Validates the 23 target custom properties extracted from a SolidWorks drawing.
 No DDS table comparison.  Rules are applied purely to the property values themselves.
 
 Input:
@@ -245,6 +245,8 @@ def verify_custom_properties(cp_extraction: dict, logger=None) -> dict:
         "HYDRO_TEST_POSITION",
         "Drawing_Number",
         "Tag_No",
+        "Serial_No",
+        "Description",
         "Equipment_Type",
         "Design_Code",
         "Material_Code",
