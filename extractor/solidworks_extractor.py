@@ -704,7 +704,8 @@ def _extract_custom_properties(swApp, swModel, logger,
         all_detected["drawing"] = list(by_source["drawing"].keys())
         # Confirmed working strategy: VARIANT(VT_BYREF) via Strategy A.
         # GetIDsOfNames returns int (not tuple) on SW2019 — logged for reference only.
-        if logger.isEnabledFor(logging.DEBUG):
+        import logging as _logging
+        if logger.isEnabledFor(_logging.DEBUG):
             import pythoncom as _pc
             diag_props = [p for p in _TARGET_PROPERTIES if p in by_source["drawing"]][:1]
             for dp in diag_props:

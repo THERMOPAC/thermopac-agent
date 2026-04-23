@@ -190,6 +190,15 @@ def verify_custom_properties(cp_extraction: dict, logger=None) -> dict:
     # ── Section A: Equipment_Configuration (mandatory gate) ───────────────────
     eq_cfg_raw = _val("Equipment_Configuration")
     eq_cfg_src = _src("Equipment_Configuration")
+    # Fallback: Property Tab Builder templates often omit Equipment_Configuration
+    # as a separate field but include Equipment_Type with the same allowed values.
+    # If Equipment_Configuration is blank but Equipment_Type is a valid config
+    # string, promote it so downstream rules can resolve correctly.
+    if _is_blank(eq_cfg_raw):
+        eq_type_val = _val("Equipment_Type")
+        if not _is_blank(eq_type_val) and _norm_text(eq_type_val) in _ALLOWED_CONFIGS:
+            eq_cfg_raw = eq_type_val
+            eq_cfg_src = _src("Equipment_Type") + " (via Equipment_Type fallback)"
     eq_cfg_norm = _norm_text(eq_cfg_raw)
     eq_cfg_valid = eq_cfg_norm in _ALLOWED_CONFIGS
 
