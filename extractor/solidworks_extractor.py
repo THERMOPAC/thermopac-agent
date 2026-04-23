@@ -781,9 +781,47 @@ def _extract_custom_properties(swApp, swModel, logger,
                 logger.warning("[CP] Pass4: GetOpenDocumentByName returned None for all known part paths")
 
         if model_doc is not None:
-            mgr = model_doc.Extension.CustomPropertyManager("")
-            by_source["model"] = _read_cpm(mgr, "model", logger)
-            all_detected["model"] = list(by_source["model"].keys())
+            # Read document-level CPM ("") first
+            try:
+                mgr = model_doc.Extension.CustomPropertyManager("")
+                doc_props = _read_cpm(mgr, "model/doc", logger)
+            except Exception as e:
+                logger.warning(f"[CP] model CustomPropertyManager(''): {e}")
+                doc_props = {}
+
+            # Read every configuration-level CPM — $PRPWLD resolves from the
+            # active configuration, so the real property values live in
+            # CustomPropertyManager("Default") or similar, not in ("").
+            config_props: dict[str, str] = {}
+            try:
+                cfg_names = _com_call(model_doc, "GetConfigurationNames") or ()
+                if isinstance(cfg_names, str):
+                    cfg_names = (cfg_names,)
+                logger.info(f"[CP] model configurations: {list(cfg_names)}")
+                for cfg in cfg_names:
+                    try:
+                        cmgr = model_doc.Extension.CustomPropertyManager(str(cfg))
+                        cfg_result = _read_cpm(cmgr, f"model/cfg({cfg})", logger)
+                        # Merge: first non-empty value per property wins
+                        for k, v in cfg_result.items():
+                            if v and not config_props.get(k):
+                                config_props[k] = v
+                    except Exception as ce:
+                        logger.warning(f"[CP] model CPM({cfg!r}): {ce}")
+            except Exception as ge:
+                logger.warning(f"[CP] model GetConfigurationNames: {ge}")
+
+            # Merge: config wins over doc-level for same key (doc-level is usually
+            # the expression link with an empty resolved value)
+            merged: dict[str, str] = {**doc_props}
+            for k, v in config_props.items():
+                if v:  # config value wins if non-empty
+                    merged[k] = v
+                elif k not in merged:
+                    merged[k] = v
+
+            by_source["model"] = merged
+            all_detected["model"] = list(merged.keys())
         else:
             logger.info("[CP] Model-level: no referenced model document accessible (all passes failed)")
     except Exception as e:
