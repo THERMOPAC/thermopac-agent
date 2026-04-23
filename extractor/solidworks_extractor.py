@@ -475,45 +475,71 @@ def _read_cpm(mgr, source_label: str, logger, probe_names=None) -> dict[str, str
 
     def _extract_one(mgr, name):
         """
-        Try multiple SolidWorks Get* APIs to read one custom property value.
+        Read one SolidWorks custom property value.
 
-        win32com late-bind note: without type-library, ByRef out-params are NOT
-        automatically marshalled back.  The workaround is to pass placeholder
-        values for every ByRef param — win32com then includes the modified values
-        in the return tuple.  We try both styles (with and without placeholders).
+        Diagnostic finding (Job 83): Get4/Get5/Get6 require ByRef (VT_BYREF) VARIANT
+        objects for their out-params — plain Python strings cause "Type mismatch".
+        Calling with only (name, useCached) gives "Parameter not optional".
 
-        API hierarchy (newest → oldest):
-          Get6(name, useCached, val, resolvedVal, wasResolved, linkToProp) → int
-          Get5(name, useCached, val, resolvedVal, wasResolved)             → int
-          Get4(name, useCached, val, resolvedVal)                         → int
-          Get2(name, useCached, val, resolvedVal)                         → int  (identical to Get4 signature in SW2019)
-        resolvedVal is always index 1 of the returned tuple.
+        Strategy A (InvokeTypes): Use _oleobj_.InvokeTypes() which lets us declare
+        each param's VT type + IN/OUT direction.  win32com then handles VT_BYREF
+        marshaling correctly and returns the out-param values in the result tuple.
+        This is the only reliable path for ByRef params in late-bind COM.
+
+        Strategy B (GetAll3): Bulk array read — arrays survive SAFEARRAY late-bind
+        better than scalar ByRef strings.
+
+        Strategy C (no extra args, fallback): original approach; works if COM
+        happens to return HRESULT-as-tuple or value-as-string.
+
+        API param flags: PARAMFLAG_FIN=1, PARAMFLAG_FOUT=2
+        Get6 → (name/in, useCached/in, val/out, resolvedVal/out, wasResolved/out, linkToProp/out)
+        Get5 → (name/in, useCached/in, val/out, resolvedVal/out, wasResolved/out)
+        Get4 → (name/in, useCached/in, val/out, resolvedVal/out)
+        resolvedVal is the 2nd out-param; in the InvokeTypes result tuple it is at index 2
+        (index 0 = HRESULT/retcode, index 1 = val, index 2 = resolvedVal).
         """
-        # ── Strategy A: pass ByRef placeholder args ──────────────────────────
-        # When win32com gets explicit args for ByRef params, it passes them as
-        # VT_BYREF variants and returns the updated values in a tuple.
-        byref_calls = [
-            ("Get6", (name, False, "", "", False, False)),
-            ("Get6", (name, True,  "", "", False, False)),
-            ("Get5", (name, False, "", "", False)),
-            ("Get5", (name, True,  "", "", False)),
-            ("Get4", (name, False, "", "")),
-            ("Get4", (name, True,  "", "")),
-            ("Get2", (name, False, "")),
-            ("Get2", (name, True,  "")),
-        ]
-        for api, args in byref_calls:
-            try:
-                ret = getattr(mgr, api)(*args)
-                v = _pick_value(ret)
-                if v:
-                    return v, f"{api}(byref,uc={args[1]})"
-            except Exception:
-                continue
+        import pythoncom
+        FIN, FOUT = 1, 2
+        VBS, VBL = pythoncom.VT_BSTR, pythoncom.VT_BOOL
+        VI4 = pythoncom.VT_I4
 
-        # ── Strategy B: no extra args (original approach) ─────────────────────
+        # Spec: (ret_type, arg_types_tuple, resolved_val_idx_in_result)
+        _invoke_specs = {
+            "Get6": ((VI4, 0),
+                     ((VBS, FIN), (VBL, FIN), (VBS, FOUT), (VBS, FOUT), (VBL, FOUT), (VBL, FOUT)),
+                     2),
+            "Get5": ((VI4, 0),
+                     ((VBS, FIN), (VBL, FIN), (VBS, FOUT), (VBS, FOUT), (VBL, FOUT)),
+                     2),
+            "Get4": ((VI4, 0),
+                     ((VBS, FIN), (VBL, FIN), (VBS, FOUT), (VBS, FOUT)),
+                     2),
+        }
+
+        # ── Strategy A: InvokeTypes (definitive ByRef fix) ───────────────────
+        for api_name, (ret_type, arg_types, rval_idx) in _invoke_specs.items():
+            for use_cached in (False, True):
+                try:
+                    dispid = mgr._oleobj_.GetIDsOfNames(0, api_name)[0]
+                    result = mgr._oleobj_.InvokeTypes(
+                        dispid, 0, 1,  # DISPATCH_METHOD
+                        ret_type, arg_types,
+                        name, use_cached  # only IN params go here
+                    )
+                    if isinstance(result, (list, tuple)) and len(result) > rval_idx:
+                        rv = str(result[rval_idx]).strip()   # resolvedVal
+                        ev = str(result[1]).strip() if len(result) > 1 else ""  # val/expr
+                        v = rv if (rv and not rv.startswith("$")) else (
+                            ev if (ev and not ev.startswith("$")) else "")
+                        if v:
+                            return v, f"InvokeTypes.{api_name}(uc={use_cached})"
+                except Exception:
+                    continue
+
+        # ── Strategy B: fallback, no extra args ───────────────────────────────
         for api in ("Get6", "Get5", "Get4", "Get2"):
-            for use_cached in (True, False):
+            for use_cached in (False, True):
                 try:
                     ret = getattr(mgr, api)(name, use_cached)
                     v = _pick_value(ret)
@@ -644,31 +670,35 @@ def _extract_custom_properties(swApp, swModel, logger,
         mgr = swModel.Extension.CustomPropertyManager("")
         by_source["drawing"] = _read_cpm(mgr, "drawing", logger)
         all_detected["drawing"] = list(by_source["drawing"].keys())
-        # Raw diagnostic: show exactly what each Get* API returns for the first
-        # target property that exists in the drawing, using both calling styles.
-        diag_props = [p for p in _TARGET_PROPERTIES if p in by_source["drawing"]][:3]
+        # Raw diagnostic: test InvokeTypes on first target property in drawing CPM.
+        # This is the definitive confirmation of which calling strategy works.
+        import pythoncom
+        diag_props = [p for p in _TARGET_PROPERTIES if p in by_source["drawing"]][:1]
         for dp in diag_props:
-            for api, args in [
-                ("Get6", (dp, False, "", "", False, False)),
-                ("Get6", (dp, False)),
-                ("Get5", (dp, False, "", "", False)),
-                ("Get5", (dp, False)),
-                ("Get4", (dp, False, "", "")),
-                ("Get4", (dp, False)),
-                ("Get2", (dp, False, "")),
-                ("Get2", (dp, False)),
+            for api_name, arg_types in [
+                ("Get6", ((pythoncom.VT_BSTR, 1), (pythoncom.VT_BOOL, 1),
+                          (pythoncom.VT_BSTR, 2), (pythoncom.VT_BSTR, 2),
+                          (pythoncom.VT_BOOL, 2), (pythoncom.VT_BOOL, 2))),
+                ("Get5", ((pythoncom.VT_BSTR, 1), (pythoncom.VT_BOOL, 1),
+                          (pythoncom.VT_BSTR, 2), (pythoncom.VT_BSTR, 2),
+                          (pythoncom.VT_BOOL, 2))),
+                ("Get4", ((pythoncom.VT_BSTR, 1), (pythoncom.VT_BOOL, 1),
+                          (pythoncom.VT_BSTR, 2), (pythoncom.VT_BSTR, 2))),
             ]:
                 try:
-                    ret = getattr(mgr, api)(*args)
-                    logger.info(
-                        f"[CPRaw] drawing CPM {api}({dp!r}, args={args[1:]}) "
-                        f"→ type={type(ret).__name__} val={ret!r}"
+                    dispid = mgr._oleobj_.GetIDsOfNames(0, api_name)[0]
+                    result = mgr._oleobj_.InvokeTypes(
+                        dispid, 0, 1, (pythoncom.VT_I4, 0),
+                        arg_types, dp, False
                     )
-                    break  # one successful call per property is enough
+                    logger.info(
+                        f"[CPRaw] InvokeTypes.{api_name}({dp!r}, False) "
+                        f"→ type={type(result).__name__} val={result!r}"
+                    )
+                    break
                 except Exception as e:
                     logger.info(
-                        f"[CPRaw] drawing CPM {api}({dp!r}, args={args[1:]}) "
-                        f"→ EXCEPTION: {e}"
+                        f"[CPRaw] InvokeTypes.{api_name}({dp!r}, False) → EXCEPTION: {e}"
                     )
     except Exception as e:
         logger.warning(f"[CP] Drawing-level CustomPropertyManager failed: {e}")
