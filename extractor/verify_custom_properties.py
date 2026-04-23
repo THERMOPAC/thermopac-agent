@@ -137,6 +137,21 @@ def _not_applicable(prop: str, source: str, value: str) -> dict:
     )
 
 
+def _not_applicable_contaminated(prop: str, source: str, value: str, config: str) -> dict:
+    """
+    Property is not applicable for the current Equipment_Configuration,
+    but a value is present in the drawing — this is a data integrity failure.
+    applicability stays 'not_applicable' to communicate why the rule fired,
+    but result is 'fail' so it enters overall scoring and blocks pass.
+    """
+    return _field(
+        prop, source, "not_applicable", value, "",
+        "fail",
+        f"Value {value!r} is present but this property is not applicable for "
+        f"Equipment_Configuration={config!r}. Remove this value from the drawing.",
+    )
+
+
 def _missing(prop: str) -> dict:
     return _field(prop, "none", "required", "", "", "hold", "Property missing or blank")
 
@@ -270,7 +285,11 @@ def verify_custom_properties(cp_extraction: dict, logger=None) -> dict:
                 norm = _norm_numeric(v) or v
                 fields.append(_required_pass(prop, s, v, norm))
         else:
-            fields.append(_not_applicable(prop, s, v))
+            # Not applicable — but if a value is present the drawing is wrong
+            if _is_blank(v):
+                fields.append(_not_applicable(prop, s, v))
+            else:
+                fields.append(_not_applicable_contaminated(prop, s, v, eq_cfg_display))
 
     # Jacket — required only for Jacketed Vessel / Jacketed Vessel and Heat Exchanger
     for prop in ("JACKET_IDP", "JACKET_MOT"):
@@ -285,7 +304,11 @@ def verify_custom_properties(cp_extraction: dict, logger=None) -> dict:
                 norm = _norm_numeric(v) or v
                 fields.append(_required_pass(prop, s, v, norm))
         else:
-            fields.append(_not_applicable(prop, s, v))
+            # Not applicable — but if a value is present the drawing is wrong
+            if _is_blank(v):
+                fields.append(_not_applicable(prop, s, v))
+            else:
+                fields.append(_not_applicable_contaminated(prop, s, v, eq_cfg_display))
 
     # ── Section D: Rule-based fields ──────────────────────────────────────────
 
