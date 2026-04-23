@@ -517,7 +517,37 @@ def _read_cpm(mgr, source_label: str, logger, probe_names=None) -> dict[str, str
                      2),
         }
 
-        # ── Strategy A: InvokeTypes (definitive ByRef fix) ───────────────────
+        # ── Strategy A: win32com VARIANT(VT_BYREF) ───────────────────────────
+        # Pass explicit VT_BSTR|VT_BYREF VARIANT objects as the out-param slots.
+        # win32com CDispatch sees them as pre-typed VARIANTs and passes them
+        # through IDispatch without re-wrapping, so COM can write back through
+        # the ByRef pointer.  After the call, variant.value holds the result.
+        try:
+            from win32com.client import VARIANT as _VARIANT
+            _VT_BS_REF  = pythoncom.VT_BSTR | pythoncom.VT_BYREF
+            _VT_BL_REF  = pythoncom.VT_BOOL | pythoncom.VT_BYREF
+            for api_name, extra_ref_args in [
+                ("Get6", [_VARIANT(_VT_BL_REF, False), _VARIANT(_VT_BL_REF, False)]),
+                ("Get5", [_VARIANT(_VT_BL_REF, False)]),
+                ("Get4", []),
+            ]:
+                for use_cached in (False, True):
+                    try:
+                        v_val  = _VARIANT(_VT_BS_REF, "")
+                        v_rval = _VARIANT(_VT_BS_REF, "")
+                        getattr(mgr, api_name)(name, use_cached, v_val, v_rval, *extra_ref_args)
+                        raw  = (v_val.value  or "").strip()
+                        res  = (v_rval.value or "").strip()
+                        v = res if (res and not res.startswith("$")) else (
+                            raw if (raw and not raw.startswith("$")) else "")
+                        if v:
+                            return v, f"VARIANT.{api_name}(uc={use_cached})"
+                    except Exception:
+                        continue
+        except ImportError:
+            pass
+
+        # ── Strategy B: InvokeTypes (explicit VT typing + PARAMFLAG_FOUT) ─────
         for api_name, (ret_type, arg_types, rval_idx) in _invoke_specs.items():
             for use_cached in (False, True):
                 try:
@@ -537,7 +567,7 @@ def _read_cpm(mgr, source_label: str, logger, probe_names=None) -> dict[str, str
                 except Exception:
                     continue
 
-        # ── Strategy B: fallback, no extra args ───────────────────────────────
+        # ── Strategy C: bare 2-arg call (original) ───────────────────────────
         for api in ("Get6", "Get5", "Get4", "Get2"):
             for use_cached in (False, True):
                 try:
@@ -670,36 +700,66 @@ def _extract_custom_properties(swApp, swModel, logger,
         mgr = swModel.Extension.CustomPropertyManager("")
         by_source["drawing"] = _read_cpm(mgr, "drawing", logger)
         all_detected["drawing"] = list(by_source["drawing"].keys())
-        # Raw diagnostic: test InvokeTypes on first target property in drawing CPM.
-        # This is the definitive confirmation of which calling strategy works.
-        import pythoncom
+        # Raw diagnostic: test all value-read strategies on one target property.
+        import pythoncom, traceback as _tb
+        from win32com.client import VARIANT as _VARIANT
         diag_props = [p for p in _TARGET_PROPERTIES if p in by_source["drawing"]][:1]
         for dp in diag_props:
+            # 1. Log DISPID lookup
+            for api_name in ("Get6", "Get5", "Get4"):
+                try:
+                    ids = mgr._oleobj_.GetIDsOfNames(0, api_name)
+                    logger.info(f"[CPRaw] GetIDsOfNames({api_name!r}) → {ids!r} (type={type(ids).__name__})")
+                except Exception as e:
+                    logger.info(f"[CPRaw] GetIDsOfNames({api_name!r}) → EXCEPTION: {e}")
+
+            # 2. VARIANT(VT_BYREF) approach
+            for api_name in ("Get6", "Get5", "Get4"):
+                try:
+                    _VT_BS_REF = pythoncom.VT_BSTR | pythoncom.VT_BYREF
+                    _VT_BL_REF = pythoncom.VT_BOOL | pythoncom.VT_BYREF
+                    v_val  = _VARIANT(_VT_BS_REF, "")
+                    v_rval = _VARIANT(_VT_BS_REF, "")
+                    if api_name == "Get6":
+                        ret = getattr(mgr, api_name)(dp, False, v_val, v_rval,
+                              _VARIANT(_VT_BL_REF, False), _VARIANT(_VT_BL_REF, False))
+                    elif api_name == "Get5":
+                        ret = getattr(mgr, api_name)(dp, False, v_val, v_rval,
+                              _VARIANT(_VT_BL_REF, False))
+                    else:
+                        ret = getattr(mgr, api_name)(dp, False, v_val, v_rval)
+                    logger.info(
+                        f"[CPRaw] VARIANT.{api_name}({dp!r}) → ret={ret!r} "
+                        f"val={v_val.value!r} rval={v_rval.value!r}"
+                    )
+                    break
+                except Exception as e:
+                    logger.info(f"[CPRaw] VARIANT.{api_name}({dp!r}) → EXCEPTION: {e} | {_tb.format_exc().splitlines()[-1]}")
+
+            # 3. InvokeTypes approach (with full traceback on failure)
             for api_name, arg_types in [
                 ("Get6", ((pythoncom.VT_BSTR, 1), (pythoncom.VT_BOOL, 1),
                           (pythoncom.VT_BSTR, 2), (pythoncom.VT_BSTR, 2),
                           (pythoncom.VT_BOOL, 2), (pythoncom.VT_BOOL, 2))),
-                ("Get5", ((pythoncom.VT_BSTR, 1), (pythoncom.VT_BOOL, 1),
-                          (pythoncom.VT_BSTR, 2), (pythoncom.VT_BSTR, 2),
-                          (pythoncom.VT_BOOL, 2))),
                 ("Get4", ((pythoncom.VT_BSTR, 1), (pythoncom.VT_BOOL, 1),
                           (pythoncom.VT_BSTR, 2), (pythoncom.VT_BSTR, 2))),
             ]:
                 try:
-                    dispid = mgr._oleobj_.GetIDsOfNames(0, api_name)[0]
+                    ids = mgr._oleobj_.GetIDsOfNames(0, api_name)
+                    dispid = ids[0] if isinstance(ids, (list, tuple)) else int(ids)
                     result = mgr._oleobj_.InvokeTypes(
                         dispid, 0, 1, (pythoncom.VT_I4, 0),
-                        arg_types, dp, False
+                        arg_types, name, False
                     )
                     logger.info(
-                        f"[CPRaw] InvokeTypes.{api_name}({dp!r}, False) "
+                        f"[CPRaw] InvokeTypes.{api_name}({dp!r}) "
                         f"→ type={type(result).__name__} val={result!r}"
                     )
                     break
                 except Exception as e:
-                    logger.info(
-                        f"[CPRaw] InvokeTypes.{api_name}({dp!r}, False) → EXCEPTION: {e}"
-                    )
+                    lines = _tb.format_exc().strip().splitlines()
+                    where = " | ".join(lines[-3:])
+                    logger.info(f"[CPRaw] InvokeTypes.{api_name}({dp!r}) → EXCEPTION: {e} | {where}")
     except Exception as e:
         logger.warning(f"[CP] Drawing-level CustomPropertyManager failed: {e}")
 
