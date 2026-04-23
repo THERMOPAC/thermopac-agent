@@ -422,7 +422,7 @@ def _com_call(obj, method: str, *args):
     return raw
 
 
-def _read_cpm(mgr, source_label: str, logger) -> dict[str, str]:
+def _read_cpm(mgr, source_label: str, logger, probe_names=None) -> dict[str, str]:
     """
     Read all properties from a CustomPropertyManager; return name→value dict.
 
@@ -439,47 +439,76 @@ def _read_cpm(mgr, source_label: str, logger) -> dict[str, str]:
     block and in the Property Tab).  Only fall back to useCached=False if True
     returns nothing, in case the property is a freshly-added literal with no
     prior cached state.
+
+    probe_names fallback
+    --------------------
+    In late-bind COM, ICustomPropertyManager.GetNames() can return None/empty
+    even when properties exist (COM SAFEARRAY not unwrapped). When this happens
+    and probe_names is supplied, we directly call Get4/Get5 for each known name
+    to bypass the enumeration failure.
     """
+    def _extract_one(mgr, name):
+        """Try Get5/Get4/Get2 with useCached=True then False; return (value, winning_call)."""
+        for api in ("Get5", "Get4", "Get2"):
+            for use_cached in (True, False):
+                try:
+                    ret = getattr(mgr, api)(name, use_cached)
+                    candidate = ""
+                    if isinstance(ret, str):
+                        candidate = ret.strip()
+                    elif isinstance(ret, (list, tuple)):
+                        for idx in (1, 0):
+                            if len(ret) > idx:
+                                c = str(ret[idx]).strip()
+                                if c:
+                                    candidate = c
+                                    break
+                    if candidate:
+                        return candidate, f"{api}(useCached={use_cached})"
+                except Exception:
+                    continue
+        return "", ""
+
     try:
         names = _com_call(mgr, "GetNames")
         if not names:
-            logger.info(f"[CP] {source_label}: CustomPropertyManager returned no names")
-            return {}
+            # Check Count to distinguish truly-empty vs SAFEARRAY unwrap failure
+            count = None
+            try:
+                count = _com_call(mgr, "Count")
+            except Exception:
+                pass
+            logger.info(
+                f"[CP] {source_label}: CustomPropertyManager returned no names "
+                f"(Count={count})"
+            )
+            if not probe_names:
+                return {}
+            # Direct probe: GetNames failed but we know what to look for.
+            # Call Get4(name, True) by name for each target property — this works
+            # even when the SAFEARRAY enumeration path is broken in late-bind COM.
+            logger.info(
+                f"[CP] {source_label}: direct-probing {len(probe_names)} known property names"
+            )
+            result: dict[str, str] = {}
+            for name in probe_names:
+                value, winning_call = _extract_one(mgr, name)
+                if value:
+                    result[name] = value
+                    logger.info(
+                        f"[CP] {source_label}  {name!r} = {value!r}  via {winning_call}"
+                    )
+            found = sum(1 for v in result.values() if v)
+            logger.info(
+                f"[CP] {source_label}: direct-probe found {found}/{len(probe_names)} "
+                f"properties with values"
+            )
+            return result
 
         result: dict[str, str] = {}
         for name in names:
             try:
-                # SolidWorks ICustomPropertyManager out-param return order
-                # (Python win32com strips HRESULT; only out-params are returned):
-                #   Get5(name, useCached) → (val, resolvedVal, wasResolved, linkToPropVar)
-                #   Get4(name, useCached) → (val, resolvedVal, wasResolved)
-                #   Get2(name, useCached) → (val, resolvedVal)
-                # resolvedVal (expanded/resolved value) is at index 1.
-                # val (raw, possibly "$PRPWLD:…") is at index 0 as last resort.
-                value = ""
-                winning_call = ""
-                for api in ("Get5", "Get4", "Get2"):
-                    for use_cached in (True, False):
-                        try:
-                            ret = getattr(mgr, api)(name, use_cached)
-                            candidate = ""
-                            if isinstance(ret, str):
-                                candidate = ret.strip()
-                            elif isinstance(ret, (list, tuple)):
-                                for idx in (1, 0):
-                                    if len(ret) > idx:
-                                        c = str(ret[idx]).strip()
-                                        if c:
-                                            candidate = c
-                                            break
-                            if candidate:
-                                value = candidate
-                                winning_call = f"{api}(useCached={use_cached})"
-                                break   # found a value — stop trying useCached variants
-                        except Exception:
-                            continue
-                    if value:
-                        break           # found a value — stop trying further APIs
+                value, winning_call = _extract_one(mgr, name)
                 result[name] = value
                 logger.debug(
                     f"[CP] {source_label}  {name!r} = {value!r}"
@@ -530,6 +559,19 @@ def _extract_custom_properties(swApp, swModel, logger,
         mgr = swModel.Extension.CustomPropertyManager("")
         by_source["drawing"] = _read_cpm(mgr, "drawing", logger)
         all_detected["drawing"] = list(by_source["drawing"].keys())
+        # Raw diagnostic: log both the expression string (val) AND resolved value
+        # for the first 5 target properties to confirm whether cache is populated.
+        diag_props = [p for p in _TARGET_PROPERTIES if p in by_source["drawing"]][:5]
+        for dp in diag_props:
+            for api in ("Get5", "Get4", "Get2"):
+                try:
+                    ret = getattr(mgr, api)(dp, True)
+                    logger.info(
+                        f"[CPRaw] drawing CPM {api}({dp!r}, useCached=True) → {ret!r}"
+                    )
+                    break
+                except Exception:
+                    continue
     except Exception as e:
         logger.warning(f"[CP] Drawing-level CustomPropertyManager failed: {e}")
 
@@ -801,7 +843,10 @@ def _extract_custom_properties(swApp, swModel, logger,
                 for cfg in cfg_names:
                     try:
                         cmgr = model_doc.Extension.CustomPropertyManager(str(cfg))
-                        cfg_result = _read_cpm(cmgr, f"model/cfg({cfg})", logger)
+                        cfg_result = _read_cpm(
+                            cmgr, f"model/cfg({cfg})", logger,
+                            probe_names=_TARGET_PROPERTIES
+                        )
                         # Merge: first non-empty value per property wins
                         for k, v in cfg_result.items():
                             if v and not config_props.get(k):
