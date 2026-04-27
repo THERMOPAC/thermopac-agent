@@ -2,12 +2,13 @@
 solidworks_extractor.py — Opens a dedicated SolidWorks instance and runs all
 10 extraction modules sequentially.
 
-Safety contract (from baseline v3):
-  - v1.0.45 test mode attaches to a running SolidWorks session when present so
-    pre-opened referenced models can be detected and measured
-  - If no running session exists, COM starts SolidWorks normally
-  - OpenDoc6 with ReadOnly | Silent flags
+Safety contract (v1.0.69+):
+  - DispatchEx() always — creates a NEW, ISOLATED SolidWorks process
+  - GetActiveObject() attach path is DISABLED — never touches engineer's session
+  - swApp.Visible = False always — no window visible during extraction
+  - OpenDoc7 attempted first; OpenDoc6 multi-pass fallback
   - CloseDoc + ExitApp always in finally block
+  - Orphan guard: if ExitApp() fails, force-kills tracked SLDWORKS.EXE PID
   - Never calls Save / SaveAs
   - Works on temp copy only
   - Checks cancel_event between modules
@@ -26,52 +27,13 @@ try:
 except ImportError:
     PYWIN32_AVAILABLE = False
 
-def _connect_sw_application(progid: str, logger):
-    """
-    Connect to SolidWorks with early binding when available, otherwise fall back
-    to late binding. Some Windows/SolidWorks installations successfully run
-    makepy but still fail EnsureDispatch with "cannot automate the makepy
-    process", so this must not block extraction.
-    """
-    for pid in (progid, "SldWorks.Application"):
-        try:
-            active = win32com.client.GetActiveObject(pid)
-            sw_app = win32com.client.Dispatch(active)
-            logger.info(f"[COM] Binding mode: late (attached to running session via {pid})")
-            version = "unknown"
-            for attr in ("RevisionNumber", "Version"):
-                try:
-                    value = getattr(sw_app, attr)
-                    version = value() if callable(value) else value
-                    if version:
-                        break
-                except Exception:
-                    pass
-            logger.info(f"[COM] SolidWorks version detected: {version}")
-            return sw_app, "late-attached", True
-        except Exception:
-            pass
-    try:
-        sw_app = win32com.client.gencache.EnsureDispatch(progid)
-        binding_mode = "early"
-        logger.info("[COM] Binding mode: early (EnsureDispatch)")
-    except Exception as e:
-        logger.warning(f"[COM] EnsureDispatch failed: {type(e).__name__}: {e}")
-        sw_app = win32com.client.Dispatch(progid)
-        binding_mode = "late"
-        logger.info("[COM] Binding mode: late (Dispatch)")
+from extractor.sw_instance import (
+    _get_sldworks_pids,
+    _kill_orphan_sw_process,
+    _launch_sw_dedicated_instance,
+    _log_sw_version,
+)
 
-    version = "unknown"
-    for attr in ("RevisionNumber", "Version"):
-        try:
-            value = getattr(sw_app, attr)
-            version = value() if callable(value) else value
-            if version:
-                break
-        except Exception:
-            pass
-    logger.info(f"[COM] SolidWorks version detected: {version}")
-    return sw_app, binding_mode, False
 
 try:
     import win32gui
@@ -1281,17 +1243,30 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         # ── Inherit search paths from user's running SW session (read-only) ───
         inherited_paths = _get_user_sw_search_paths(config.sw_progid, logger)
 
-        logger.info("[Extractor] Connecting to SolidWorks COM…")
-        swApp, binding_mode, attached_existing_session = _connect_sw_application(config.sw_progid, logger)
-        # Force full COM initialisation so IDrawingDoc interface is fully loaded.
-        # Visible=True + UserControl=True + a brief delay ensures SolidWorks has
-        # finished its own COM registration before we attempt OpenDoc.
-        swApp.Visible = True
+        # Snapshot existing SLDWORKS.EXE PIDs BEFORE launch so we can identify
+        # the agent's own process for orphan-kill if ExitApp() fails later.
+        pids_before_launch = _get_sldworks_pids()
+
+        logger.info("[Extractor] Launching dedicated SolidWorks instance…")
+        swApp, binding_mode = _launch_sw_dedicated_instance(config.sw_progid, logger)
+
+        # Determine the new PID (difference before vs. after launch)
+        pids_after_launch  = _get_sldworks_pids()
+        new_pids           = pids_after_launch - pids_before_launch
+        agent_sw_pid       = next(iter(new_pids), None)
+        if agent_sw_pid:
+            logger.info(f"[COM] Agent's dedicated SLDWORKS.EXE PID: {agent_sw_pid}")
+        else:
+            logger.info("[COM] PID not isolated (DispatchEx reused existing process — orphan guard disabled)")
+
+        # Keep hidden — this is a background agent, never show the SW window
+        swApp.Visible = False
         try:
-            swApp.UserControl = True
+            swApp.UserControl = False
         except Exception:
             pass
         swApp.UserControlBackground = True
+        logger.info("[Extractor] SolidWorks instance is hidden (Visible=False)")
         logger.info("[Extractor] Waiting 2.5 s for SolidWorks COM to fully initialise…")
         time.sleep(2.5)
         logger.info(f"[Extractor] SolidWorks ready ({time.monotonic() - t_launch:.1f}s)")
@@ -1343,7 +1318,7 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
             "file_size_bytes": file_size,
             "open_pass": "",
             "open_mode": "",
-            "solidworks_session": "attached_existing" if attached_existing_session else "created_or_reused_by_com",
+            "solidworks_session": f"dedicated-isolated (binding={binding_mode} pid={agent_sw_pid})",
             "reference_diagnostics": reference_diagnostics,
             "preopened_dependencies": preopen_diagnostics,
             "open_mode_influence": {
@@ -1582,21 +1557,34 @@ def run_extraction(temp_path: str, config, cancel_event: threading.Event,
         return result
 
     finally:
-        # Always close document and quit the dedicated SW instance
+        # ── Step 1: Close the drawing document ────────────────────────────────
         if swModel is not None:
             try:
                 swApp.CloseDoc(temp_path)
-                logger.info("[Extractor] Document closed")
+                logger.info("[COM] Document closed")
             except Exception as e:
-                logger.warning(f"[Extractor] CloseDoc error: {e}")
-        if swApp is not None and not locals().get("attached_existing_session", False):
+                logger.warning(f"[COM] CloseDoc error: {e}")
+
+        # ── Step 2: Exit the dedicated SolidWorks instance ────────────────────
+        # Always call ExitApp() — this is a dedicated instance, not the engineer's.
+        if swApp is not None:
             try:
                 swApp.ExitApp()
-                logger.info("[Extractor] SolidWorks instance exited")
+                logger.info("[COM] Dedicated SolidWorks instance exited cleanly")
             except Exception as e:
-                logger.warning(f"[Extractor] ExitApp error: {e}")
-        elif swApp is not None:
-            logger.info("[Extractor] Attached SolidWorks session left running")
+                logger.warning(f"[COM] ExitApp() failed: {type(e).__name__}: {e}")
+                # ── Orphan guard: force-kill the tracked PID ───────────────
+                _pid = locals().get("agent_sw_pid")
+                if _pid:
+                    logger.warning(f"[COM] Orphan guard: attempting force-kill of PID {_pid}…")
+                    _kill_orphan_sw_process(_pid, logger)
+                else:
+                    logger.warning(
+                        "[COM] Orphan guard: no PID tracked — cannot force-kill. "
+                        "Check Task Manager for stray SLDWORKS.EXE processes."
+                    )
+
+        # ── Step 3: Release COM apartment ────────────────────────────────────
         try:
             pythoncom.CoUninitialize()
         except Exception:

@@ -1,96 +1,77 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    ThermopacAgent Windows Installer
+    ThermopacStructuringAgent Windows Installer (PowerShell)
 .DESCRIPTION
-    Self-contained installer for the ThermopacAgent SolidWorks extraction service.
-    Downloads Python 3.11 Embeddable, installs all dependencies offline-capable,
-    generates win32com SolidWorks COM type library cache, and creates run scripts.
+    Downloads Python 3.11 Embeddable, installs pywin32 + requests,
+    generates SolidWorks COM type library cache, and creates run scripts.
+    Used when the Inno Setup .exe installer did not bundle Python.
 .PARAMETER InstallDir
-    Installation directory (default: C:\Program Files\ThermopacAgent)
+    Installation directory (default: C:\Program Files\ThermopacStructuringAgent)
 .PARAMETER DataDir
-    Runtime data directory for logs and temp files (default: C:\ThermopacAgent)
+    Runtime data directory for logs and temp files (default: C:\ThermopacStructurer)
+.PARAMETER StagingRoot
+    Root folder where structured drawings are staged
+    (default: C:\ThermopacStaging\drawings)
 .PARAMETER Silent
     Skip interactive prompts; use defaults for everything
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File setup.ps1
-    powershell -ExecutionPolicy Bypass -File setup.ps1 -InstallDir "D:\ThermopacAgent"
     powershell -ExecutionPolicy Bypass -File setup.ps1 -Silent
 #>
 param(
-    [string]$InstallDir  = "C:\Program Files\ThermopacAgentDev",
-    [string]$DataDir     = "C:\ThermopacAgentDev",
+    [string]$InstallDir   = "C:\Program Files\ThermopacStructuringAgent",
+    [string]$DataDir      = "C:\ThermopacStructurer",
+    [string]$StagingRoot  = "C:\ThermopacStaging\drawings",
     [switch]$Silent
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ── Constants ────────────────────────────────────────────────────────────────
-$AGENT_VERSION   = "1.0.68"
-$PY_VERSION      = "3.11.9"
-$PY_EMBED_ZIP    = "python-$PY_VERSION-embed-amd64.zip"
-$PY_EMBED_URL    = "https://www.python.org/ftp/python/$PY_VERSION/$PY_EMBED_ZIP"
-$GET_PIP_URL     = "https://bootstrap.pypa.io/get-pip.py"
-$PY_PTH_FILE     = "python311._pth"
-$REQUIRED_PKGS   = @("pywin32>=306", "requests>=2.31.0")
-$APP_URL         = "https://5d05ae61-8225-4651-bb76-b4e20a4ddabb-00-3mex6zlihlmft.janeway.replit.dev"
-$LEGACY_APP_URL  = "https://thermopac-communication-thermopacllp.replit.app"
+# ── Constants ──────────────────────────────────────────────────────────────────
+$AGENT_VERSION  = "1.0.0"
+$PY_VERSION     = "3.11.9"
+$PY_EMBED_ZIP   = "python-$PY_VERSION-embed-amd64.zip"
+$PY_EMBED_URL   = "https://www.python.org/ftp/python/$PY_VERSION/$PY_EMBED_ZIP"
+$GET_PIP_URL    = "https://bootstrap.pypa.io/get-pip.py"
+$REQUIRED_PKGS  = @("pywin32>=306", "requests>=2.28.0")
+$APP_URL        = "https://thermopac-communication-thermopacllp.replit.app"
 
-$ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
-$SourceDir  = Split-Path -Parent $ScriptDir  # local-agent root
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+# When run via Inno Setup post-install, ScriptDir = {app}
+# When run standalone, ScriptDir = structurer_pkg\installer\
+$SourceDir = $ScriptDir
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
+# ── Helpers ────────────────────────────────────────────────────────────────────
 function Write-Header {
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host "  ThermopacAgent $AGENT_VERSION — Windows Installer" -ForegroundColor Cyan
-    Write-Host "  THERMOPAC ERP  |  SolidWorks Extraction Agent" -ForegroundColor Cyan
+    Write-Host "  ThermopacStructuringAgent $AGENT_VERSION — Windows Setup" -ForegroundColor Cyan
+    Write-Host "  THERMOPAC ERP  |  SolidWorks Drawing Structuring Agent" -ForegroundColor Cyan
+    Write-Host "  Phase 1 — WRITE ONLY" -ForegroundColor Cyan
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
 }
 
-function Write-Step([string]$msg) {
-    Write-Host "[STEP] $msg" -ForegroundColor Yellow
-}
-
-function Write-OK([string]$msg) {
-    Write-Host "  [OK] $msg" -ForegroundColor Green
-}
-
-function Write-Warn([string]$msg) {
-    Write-Host "  [WARN] $msg" -ForegroundColor DarkYellow
-}
-
-function Write-Fail([string]$msg) {
-    Write-Host "  [FAIL] $msg" -ForegroundColor Red
-}
-
-function Confirm-Proceed([string]$prompt) {
-    if ($Silent) { return }
-    $ans = Read-Host "$prompt [Y/n]"
-    if ($ans -match '^[Nn]') {
-        Write-Host "Aborted." -ForegroundColor Red
-        exit 1
-    }
-}
+function Write-Step([string]$msg) { Write-Host "[STEP] $msg" -ForegroundColor Yellow }
+function Write-OK([string]$msg)   { Write-Host "  [OK] $msg"   -ForegroundColor Green }
+function Write-Warn([string]$msg) { Write-Host "  [WARN] $msg" -ForegroundColor DarkYellow }
+function Write-Fail([string]$msg) { Write-Host "  [FAIL] $msg" -ForegroundColor Red }
 
 function Download-File([string]$Url, [string]$Dest) {
     Write-Host "    Downloading: $Url" -ForegroundColor DarkGray
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $wc = New-Object System.Net.WebClient
-    $wc.Headers.Add("User-Agent", "ThermopacAgent-Installer/$AGENT_VERSION")
+    $wc.Headers.Add("User-Agent", "ThermopacStructurer-Installer/$AGENT_VERSION")
     $wc.DownloadFile($Url, $Dest)
     Write-OK "Downloaded to: $Dest"
 }
 
-# ── Step 1: Validate Prerequisites ───────────────────────────────────────────
+# ── Step 1: Prerequisites ──────────────────────────────────────────────────────
 Write-Header
-
 Write-Step "Checking prerequisites..."
 
-# Windows version
 $os = [System.Environment]::OSVersion.Version
 if ($os.Major -lt 10) {
     Write-Fail "Windows 10 or later is required (found: $($os.Major).$($os.Minor))"
@@ -98,13 +79,13 @@ if ($os.Major -lt 10) {
 }
 Write-OK "Windows $($os.Major).$($os.Minor) — OK"
 
-# Check SolidWorks is installed
+# ── Step 2: Detect SolidWorks ─────────────────────────────────────────────────
 Write-Step "Detecting SolidWorks installation..."
 $sw_progid  = $null
 $sw_version = 0
 $sw_dir     = $null
 
-$sw_versions = @{
+$sw_map = @{
     2024 = "SldWorks.Application.32"
     2023 = "SldWorks.Application.31"
     2022 = "SldWorks.Application.30"
@@ -113,23 +94,21 @@ $sw_versions = @{
     2019 = "SldWorks.Application.27"
 }
 
-foreach ($year in ($sw_versions.Keys | Sort-Object -Descending)) {
-    $progid = $sw_versions[$year]
+foreach ($year in ($sw_map.Keys | Sort-Object -Descending)) {
+    $progid = $sw_map[$year]
     try {
         $key = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey($progid)
-        if ($key -ne $null) {
+        if ($null -ne $key) {
             $sw_version = $year
             $sw_progid  = $progid
             $key.Close()
-
-            # Find install directory
             foreach ($base in @(
                 "SOFTWARE\SolidWorks\SolidWorks $year\Setup",
                 "SOFTWARE\WOW6432Node\SolidWorks\SolidWorks $year\Setup"
             )) {
                 try {
                     $rk = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($base)
-                    if ($rk -ne $null) {
+                    if ($null -ne $rk) {
                         $d = $rk.GetValue("SldWorks dir")
                         if ($d -and (Test-Path $d)) { $sw_dir = $d }
                         $rk.Close()
@@ -142,61 +121,50 @@ foreach ($year in ($sw_versions.Keys | Sort-Object -Descending)) {
 }
 
 if (-not $sw_progid) {
-    Write-Fail "SolidWorks NOT detected.  Install SolidWorks before running this installer."
-    Write-Host ""
-    Write-Host "  Supported versions: SolidWorks 2019 – 2024" -ForegroundColor Yellow
+    Write-Fail "SolidWorks NOT detected. Install SolidWorks 2019–2024 before running."
     if (-not $Silent) { Read-Host "Press Enter to exit" }
     exit 1
 }
-
-Write-OK "SolidWorks $sw_version detected  ($sw_progid)"
+Write-OK "SolidWorks $sw_version ($sw_progid)"
 if ($sw_dir) { Write-OK "SolidWorks directory: $sw_dir" }
 
-# ── Step 2: Create directories ───────────────────────────────────────────────
-Write-Step "Creating installation directories..."
-
-foreach ($d in @($InstallDir, "$DataDir\logs", "$DataDir\temp", "$DataDir\config")) {
-    if (-not (Test-Path $d)) {
-        New-Item -ItemType Directory -Path $d -Force | Out-Null
-    }
+# ── Step 3: Create directories ────────────────────────────────────────────────
+Write-Step "Creating directories..."
+foreach ($d in @($InstallDir, "$DataDir\logs", "$DataDir\temp", $StagingRoot)) {
+    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
     Write-OK $d
 }
 
-# Set ACLs on data dir so any user can write
-try {
-    $acl  = Get-Acl $DataDir
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        "Everyone", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
-    $acl.SetAccessRule($rule)
-    Set-Acl $DataDir $acl
-    Write-OK "Permissions set on $DataDir"
-} catch {
-    Write-Warn "Could not set ACL on $DataDir (non-fatal): $_"
+# Set ACLs on data/staging dirs so any user can write
+foreach ($d in @($DataDir, $StagingRoot)) {
+    try {
+        $acl  = Get-Acl $d
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            "Everyone", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+        $acl.SetAccessRule($rule)
+        Set-Acl $d $acl
+        Write-OK "Permissions set on $d"
+    } catch {
+        Write-Warn "Could not set ACL on $d (non-fatal): $_"
+    }
 }
 
-# ── Step 3: Python Embeddable ─────────────────────────────────────────────────
+# ── Step 4: Python Embeddable ─────────────────────────────────────────────────
 Write-Step "Setting up Python $PY_VERSION (embedded)..."
-
-$PyDir   = "$InstallDir\python"
-$PyExe   = "$PyDir\python.exe"
+$PyDir = "$InstallDir\python"
+$PyExe = "$PyDir\python.exe"
 $ZipDest = "$env:TEMP\$PY_EMBED_ZIP"
 
 if (-not (Test-Path $PyExe)) {
     if (-not (Test-Path $ZipDest)) {
-        Write-Host "    Downloading Python embeddable package..."
-        try {
-            Download-File $PY_EMBED_URL $ZipDest
-        } catch {
+        try { Download-File $PY_EMBED_URL $ZipDest }
+        catch {
             Write-Fail "Download failed: $_"
-            Write-Host "  Manual fix: Download $PY_EMBED_URL" -ForegroundColor Yellow
-            Write-Host "  and place it at: $ZipDest" -ForegroundColor Yellow
             exit 1
         }
     } else {
         Write-OK "Using cached download: $ZipDest"
     }
-
-    Write-Host "    Extracting Python embeddable..."
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipDest, $PyDir)
     Write-OK "Extracted to $PyDir"
@@ -204,238 +172,145 @@ if (-not (Test-Path $PyExe)) {
     Write-OK "Python already present: $PyExe"
 }
 
-# ── Enable site-packages in embeddable Python ──────────────────────────────
+# Enable site-packages
 $pthFile = Get-ChildItem $PyDir -Filter "python*._pth" | Select-Object -First 1
 if ($pthFile) {
     $pthContent = Get-Content $pthFile.FullName -Raw
     if ($pthContent -match "#import site") {
         $pthContent = $pthContent -replace "#import site", "import site"
         Set-Content $pthFile.FullName $pthContent -NoNewline
-        Write-OK "Enabled site-packages in $($pthFile.Name)"
+        Write-OK "site-packages enabled in $($pthFile.Name)"
     }
-    # Also add Scripts to path
     if ($pthContent -notmatch "Scripts") {
         Add-Content $pthFile.FullName "`nScripts"
     }
-} else {
-    Write-Warn "._pth file not found — site-packages may not work"
 }
 
-# ── Step 4: pip ───────────────────────────────────────────────────────────────
+# ── Step 5: pip ───────────────────────────────────────────────────────────────
 Write-Step "Installing pip..."
-
 $PipScript = "$env:TEMP\get-pip.py"
 $PipExe    = "$PyDir\Scripts\pip.exe"
 
 if (-not (Test-Path $PipExe)) {
     if (-not (Test-Path $PipScript)) {
-        try {
-            Download-File $GET_PIP_URL $PipScript
-        } catch {
-            Write-Fail "Could not download get-pip.py: $_"
-            exit 1
-        }
+        try { Download-File $GET_PIP_URL $PipScript }
+        catch { Write-Fail "Could not download get-pip.py: $_"; exit 1 }
     }
-    Write-Host "    Running get-pip.py..."
-    & $PyExe $PipScript --no-warn-script-location 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
-    if ($LASTEXITCODE -ne 0) {
-        Write-Fail "pip installation failed (exit $LASTEXITCODE)"
-        exit 1
-    }
+    & $PyExe $PipScript --no-warn-script-location 2>&1 |
+        ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+    if ($LASTEXITCODE -ne 0) { Write-Fail "pip installation failed"; exit 1 }
     Write-OK "pip installed"
 } else {
     Write-OK "pip already present"
 }
 
-$PipExe = "$PyDir\Scripts\pip.exe"
-
-# ── Step 5: Install Python packages ─────────────────────────────────────────
+# ── Step 6: Python packages ───────────────────────────────────────────────────
 Write-Step "Installing Python packages..."
-
 foreach ($pkg in $REQUIRED_PKGS) {
     Write-Host "    pip install $pkg ..."
     & $PyExe -m pip install $pkg --no-warn-script-location 2>&1 |
         ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
-    if ($LASTEXITCODE -ne 0) {
-        Write-Fail "Failed to install $pkg"
-        exit 1
-    }
+    if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to install $pkg"; exit 1 }
     Write-OK $pkg
 }
 
-# ── Step 6: pywin32 post-install (registers COM DLLs) ────────────────────────
-Write-Step "Running pywin32 post-install (registers COM support DLLs)..."
-
-$pywin32postinstall = "$PyDir\Scripts\pywin32_postinstall.py"
-if (-not (Test-Path $pywin32postinstall)) {
-    # Try site-packages location
-    $pywin32postinstall = "$PyDir\Lib\site-packages\pywin32_postinstall.py"
+# ── Step 7: pywin32 post-install ─────────────────────────────────────────────
+Write-Step "Running pywin32 post-install..."
+$pywin32post = "$PyDir\Scripts\pywin32_postinstall.py"
+if (-not (Test-Path $pywin32post)) {
+    $pywin32post = "$PyDir\Lib\site-packages\pywin32_postinstall.py"
 }
-if (Test-Path $pywin32postinstall) {
-    & $PyExe $pywin32postinstall -install 2>&1 |
+if (Test-Path $pywin32post) {
+    & $PyExe $pywin32post -install 2>&1 |
         ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
     Write-OK "pywin32 post-install complete"
 } else {
-    Write-Warn "pywin32_postinstall.py not found — skipping (non-fatal)"
+    Write-Warn "pywin32_postinstall.py not found (non-fatal)"
 }
 
-# ── Step 7: Generate SolidWorks COM type library cache (makepy) ───────────────
+# ── Step 8: SolidWorks makepy cache ──────────────────────────────────────────
 Write-Step "Generating SolidWorks COM type library cache (makepy)..."
-Write-Host "    This enables IDrawingDoc methods (GetCurrentSheet, GetFirstView, etc.)"
-
 $makepy_ok = $false
 
-# Method A: via ProgID — standard makepy
-Write-Host "    [Makepy-A] Trying: python -m win32com.client.makepy `"$sw_progid`"..."
-$makepy_out = & $PyExe -m win32com.client.makepy $sw_progid 2>&1
+# Method A
+Write-Host "    [Makepy-A] python -m win32com.client.makepy `"$sw_progid`"..."
+$out = & $PyExe -m win32com.client.makepy $sw_progid 2>&1
 if ($LASTEXITCODE -eq 0) {
     Write-OK "Makepy cache generated via ProgID"
     $makepy_ok = $true
 } else {
-    Write-Warn "Method A failed: $makepy_out"
+    Write-Warn "Method A failed: $out"
 }
 
-# Method B: via TLB file found in SolidWorks install directory
+# Method B: TLB file scan
 if (-not $makepy_ok -and $sw_dir) {
-    Write-Host "    [Makepy-B] Scanning SolidWorks directory for type library files..."
-    $tlb_candidates = @()
-
+    Write-Host "    [Makepy-B] Scanning SolidWorks directory for TLB files..."
+    $tlb_cands = @()
     foreach ($ext in @("*.tlb", "sldworks.exe")) {
-        $found = Get-ChildItem -Path $sw_dir -Filter $ext -ErrorAction SilentlyContinue |
+        $tlb_cands += Get-ChildItem -Path $sw_dir -Filter $ext -ErrorAction SilentlyContinue |
             Select-Object -First 3
-        $tlb_candidates += $found
     }
-    # Also check common sub-folders
     foreach ($sub in @("api\redist", "api")) {
-        $sub_path = Join-Path $sw_dir $sub
-        if (Test-Path $sub_path) {
-            Get-ChildItem -Path $sub_path -Filter "*.tlb" -ErrorAction SilentlyContinue |
-                ForEach-Object { $tlb_candidates += $_ }
+        $sp = Join-Path $sw_dir $sub
+        if (Test-Path $sp) {
+            Get-ChildItem -Path $sp -Filter "*.tlb" -ErrorAction SilentlyContinue |
+                ForEach-Object { $tlb_cands += $_ }
         }
     }
-
-    foreach ($tlb in $tlb_candidates) {
-        Write-Host "    [Makepy-B] Trying: $($tlb.FullName)..."
+    foreach ($tlb in $tlb_cands) {
         $out = & $PyExe -m win32com.client.makepy "`"$($tlb.FullName)`"" 2>&1
         if ($LASTEXITCODE -eq 0) {
-            Write-OK "Makepy cache generated from $($tlb.Name)"
+            Write-OK "Makepy cache from $($tlb.Name)"
             $makepy_ok = $true
             break
         }
     }
-    if (-not $makepy_ok) {
-        Write-Warn "Method B: no TLB produced cache"
-    }
-}
-
-# Method C: inline Python script using pythoncom.LoadTypeLib directly
-if (-not $makepy_ok) {
-    Write-Host "    [Makepy-C] Attempting pythoncom.LoadTypeLib via registry walk..."
-    $inline = @"
-import sys, winreg, pythoncom, win32com.client.gencache as gc
-progid = sys.argv[1]
-try:
-    with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, progid + r'\CLSID') as k:
-        clsid = winreg.QueryValue(k, '')
-    with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r'CLSID\{}\TypeLib'.format(clsid)) as k:
-        tl_clsid = winreg.QueryValue(k, '')
-    versions = []
-    with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r'TypeLib\{}'.format(tl_clsid)) as k:
-        i = 0
-        while True:
-            try:
-                vs = winreg.EnumKey(k, i); i += 1
-                p = vs.split('.')
-                versions.append((int(p[0]), int(p[1]) if len(p)>1 else 0, vs))
-            except OSError:
-                break
-    if not versions:
-        raise ValueError('no versions')
-    major, minor, ver_str = sorted(versions)[-1]
-    for arch in ('win64','win32',''):
-        sub = r'TypeLib\{}\{}\0'.format(tl_clsid, ver_str)
-        kp  = sub + '\\' + arch if arch else sub
-        try:
-            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, kp) as k:
-                fp = winreg.QueryValue(k,'').strip('"').split(',')[0].strip()
-            import os
-            if os.path.isfile(fp):
-                tl  = pythoncom.LoadTypeLib(fp)
-                tla = tl.GetLibAttr()
-                gc.EnsureModule(str(tla[0]), 0, tla[3], tla[4],
-                                bForDemand=False, bBuildHidden=True)
-                print('OK:' + fp)
-                sys.exit(0)
-        except Exception as ex:
-            pass
-    raise RuntimeError('no TLB file loaded')
-except Exception as ex:
-    print('FAIL:' + str(ex), file=sys.stderr)
-    sys.exit(1)
-"@
-    $inline | Set-Content "$env:TEMP\makepy_sw.py" -Encoding UTF8
-    $out = & $PyExe "$env:TEMP\makepy_sw.py" $sw_progid 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Write-OK "Makepy cache generated via inline pythoncom.LoadTypeLib"
-        $makepy_ok = $true
-    } else {
-        Write-Warn "Method C failed: $out"
-    }
+    if (-not $makepy_ok) { Write-Warn "Method B: no TLB produced cache" }
 }
 
 if (-not $makepy_ok) {
-    Write-Warn "SolidWorks COM cache could not be pre-generated automatically."
-    Write-Host ""
-    Write-Host "  This is not a fatal installer error — the agent will attempt" -ForegroundColor Yellow
-    Write-Host "  to generate the cache at runtime using three fallback methods." -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "  If the agent still fails with 'makepy' errors, run manually:" -ForegroundColor Yellow
-    Write-Host "    $PyExe -m win32com.client.makepy `"$sw_progid`"" -ForegroundColor White
-    Write-Host ""
+    Write-Warn "SolidWorks COM cache could not be pre-generated."
+    Write-Host "  The agent will generate the cache at runtime (3 fallback methods)." -ForegroundColor Yellow
 }
 
-# ── Step 8: Copy agent source files ──────────────────────────────────────────
-Write-Step "Installing agent files..."
+# ── Step 9: Copy agent files ──────────────────────────────────────────────────
+Write-Step "Installing agent files to $InstallDir..."
 
-# Determine source — works whether run from installer\ subfolder or root
-$agent_sources = @("agent", "extractor", "_com_helper.py")
-foreach ($item in $agent_sources) {
-    $src = Join-Path $SourceDir $item
+# Source detection: works from installer\ subfolder OR from {app} (Inno Setup)
+$agent_dirs = @("agent", "extractor", "structurer")
+foreach ($dir in $agent_dirs) {
+    # Try ScriptDir (when setup.ps1 is in installer\ next to the source)
+    $src = Join-Path (Split-Path -Parent $ScriptDir) $dir
     if (-not (Test-Path $src)) {
-        Write-Warn "Source not found (non-fatal): $src"
+        # When Inno Setup placed setup.ps1 in {app}, source is {app} itself
+        $src = Join-Path $ScriptDir $dir
+    }
+    if (-not (Test-Path $src)) {
+        Write-Warn "Source not found (non-fatal): $dir"
         continue
     }
-    $dest = Join-Path $InstallDir $item
-    if (Test-Path $src -PathType Container) {
-        if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-        Copy-Item $src $dest -Recurse -Force
-    } else {
-        Copy-Item $src $dest -Force
-    }
-    Write-OK "Installed: $item"
+    $dest = Join-Path $InstallDir $dir
+    if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+    Copy-Item $src $dest -Recurse -Force
+    Write-OK "Installed: $dir\"
 }
 
-# ── Step 9: Write config.ini ──────────────────────────────────────────────────
+# ── Step 10: Write config.ini ─────────────────────────────────────────────────
 Write-Step "Creating config.ini..."
-
 $config_path = "$InstallDir\config.ini"
 if (-not (Test-Path $config_path)) {
-    $machine_name = $env:COMPUTERNAME
-    $config_content = @"
-; ThermopacAgent configuration
-; Generated by installer v$AGENT_VERSION
+    $cfg = @"
+; ThermopacStructuringAgent configuration
+; Generated by setup.ps1 v$AGENT_VERSION
 
 [cloud]
 api_url    = $APP_URL
-node_id    = $machine_name
+node_id    = $env:COMPUTERNAME
 node_token = REPLACE_WITH_YOUR_TOKEN
 
 [agent]
 ; testing | production
-; testing  -- auto-generates token and self-registers with cloud
-; production -- requires cloud/admin-issued token, no auto-registration
-mode = testing
-
+mode              = production
 poll_interval_sec = 10
 job_timeout_sec   = 600
 max_retries       = 3
@@ -445,99 +320,89 @@ temp_dir = $DataDir\temp
 log_dir  = $DataDir\logs
 
 [solidworks]
-; Auto-detected during installation
-solidworks_version = $sw_version
-; solidworks_progid =
-visible = false
-
-; Semicolon-separated folders to search for referenced parts/assemblies
+; Explicit ProgID — takes priority over solidworks_version.
+; SolidWorks 2019=.27  2020=.28  2021=.29  2022=.30  2023=.31  2024=.32
+solidworks_progid = $sw_progid
+visible           = false
 model_search_path =
+
+[structurer]
+; REQUIRED: absolute path to the approved SolidWorks drawing template (.drwdot)
+template_path =
+; Root folder where structured drawings are staged
+staging_root  = $StagingRoot
 "@
-    Set-Content $config_path $config_content -Encoding UTF8
+    Set-Content $config_path $cfg -Encoding UTF8
     Write-OK "Created: $config_path"
 } else {
-    $existing_config = Get-Content $config_path -Raw
-    if ($existing_config -like "*$LEGACY_APP_URL*") {
-        $existing_config = $existing_config.Replace($LEGACY_APP_URL, $APP_URL)
-        Set-Content $config_path $existing_config -Encoding UTF8
-        Write-OK "Updated existing config.ini api_url to Development backend: $config_path"
-    } else {
-        Write-OK "Existing config.ini preserved: $config_path"
-    }
+    Write-OK "Existing config.ini preserved: $config_path"
 }
 
-# ── Step 10: Create run scripts ───────────────────────────────────────────────
+# ── Step 11: Write run scripts ────────────────────────────────────────────────
 Write-Step "Creating run scripts..."
 
-# run.bat
 $run_bat = @"
 @echo off
-title ThermopacAgent v$AGENT_VERSION
-:: UTF-8 output — prevents UnicodeEncodeError on Windows cp1252 consoles
+title ThermopacStructuringAgent v$AGENT_VERSION
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
 echo.
-echo  ThermopacAgent — SolidWorks Extraction Agent
-echo  THERMOPAC ERP Integration
+echo  ThermopacStructuringAgent -- SolidWorks Drawing Structuring Agent
+echo  THERMOPAC ERP Integration  ^|  Phase 1  ^|  v$AGENT_VERSION
 echo.
-"$PyExe" "$InstallDir\agent\main.py" --config "$config_path" %*
+"$PyExe" "$InstallDir\agent\main_structurer.py" --config "$config_path" %*
 pause
 "@
 Set-Content "$InstallDir\run.bat" $run_bat -Encoding ASCII
 Write-OK "Created: $InstallDir\run.bat"
 
-# run-service.bat (no pause, for scheduled task use)
-$run_service_bat = @"
+$run_svc_bat = @"
 @echo off
-"$PyExe" "$InstallDir\agent\main.py" --config "$config_path"
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+start "" /B "$PyExe" "$InstallDir\agent\main_structurer.py" --config "$config_path"
 "@
-Set-Content "$InstallDir\run-service.bat" $run_service_bat -Encoding ASCII
+Set-Content "$InstallDir\run-service.bat" $run_svc_bat -Encoding ASCII
 Write-OK "Created: $InstallDir\run-service.bat"
 
-# makepy-repair.bat — standalone repair tool
 $makepy_bat = @"
 @echo off
-echo ThermopacAgent — SolidWorks COM Cache Repair
+echo ThermopacStructuringAgent -- SolidWorks COM Cache Repair
 echo.
-echo Regenerating win32com type library cache for: $sw_progid
 "$PyExe" -m win32com.client.makepy "$sw_progid"
 if errorlevel 1 (
-    echo.
-    echo Method A failed. Trying pythoncom approach...
-    "$PyExe" "$env:TEMP\makepy_sw.py" "$sw_progid"
+    echo Method A failed. Trying gencache...
+    "$PyExe" -c "import win32com.client.gencache as g; g.EnsureDispatch('$sw_progid')"
 )
 echo.
-echo Done. Restart ThermopacAgent.
+echo Done. Restart ThermopacStructuringAgent.
 pause
 "@
 Set-Content "$InstallDir\makepy-repair.bat" $makepy_bat -Encoding ASCII
 Write-OK "Created: $InstallDir\makepy-repair.bat"
 
-# ── Step 11: Start Menu shortcut ─────────────────────────────────────────────
-Write-Step "Creating Start Menu shortcut..."
-
+# ── Step 12: Start Menu shortcut ─────────────────────────────────────────────
+Write-Step "Creating Start Menu shortcuts..."
 try {
-    $StartMenu = [System.Environment]::GetFolderPath("CommonPrograms")
-    $ShortcutDir = "$StartMenu\ThermopacAgent"
-    if (-not (Test-Path $ShortcutDir)) { New-Item -ItemType Directory -Path $ShortcutDir -Force | Out-Null }
-
+    $StartMenu   = [System.Environment]::GetFolderPath("CommonPrograms")
+    $ShortcutDir = "$StartMenu\ThermopacStructuringAgent"
+    if (-not (Test-Path $ShortcutDir)) {
+        New-Item -ItemType Directory -Path $ShortcutDir -Force | Out-Null
+    }
     $WshShell = New-Object -ComObject WScript.Shell
 
-    # Main shortcut
-    $sc = $WshShell.CreateShortcut("$ShortcutDir\ThermopacAgent.lnk")
+    $sc = $WshShell.CreateShortcut("$ShortcutDir\ThermopacStructuringAgent.lnk")
     $sc.TargetPath = "$InstallDir\run.bat"
     $sc.WorkingDirectory = $InstallDir
-    $sc.Description = "ThermopacAgent — SolidWorks Extraction Agent"
+    $sc.Description = "ThermopacStructuringAgent — SolidWorks Drawing Structuring Agent"
     $sc.Save()
 
-    # Config shortcut
     $sc2 = $WshShell.CreateShortcut("$ShortcutDir\Edit Config.lnk")
     $sc2.TargetPath = "notepad.exe"
     $sc2.Arguments  = "`"$config_path`""
-    $sc2.Description = "Edit ThermopacAgent configuration"
+    $sc2.Description = "Edit ThermopacStructuringAgent configuration"
     $sc2.Save()
 
-    # Repair shortcut
     $sc3 = $WshShell.CreateShortcut("$ShortcutDir\Repair COM Cache.lnk")
     $sc3.TargetPath = "$InstallDir\makepy-repair.bat"
     $sc3.WorkingDirectory = $InstallDir
@@ -549,7 +414,22 @@ try {
     Write-Warn "Could not create Start Menu shortcuts: $_"
 }
 
-# ── Step 12: Optional scheduled task ─────────────────────────────────────────
+# ── Step 13: Desktop shortcut ─────────────────────────────────────────────────
+Write-Step "Creating Desktop shortcut..."
+try {
+    $Desktop = [System.Environment]::GetFolderPath("CommonDesktopDirectory")
+    $WshShell = New-Object -ComObject WScript.Shell
+    $sc = $WshShell.CreateShortcut("$Desktop\SolidWorks Structuring Agent.lnk")
+    $sc.TargetPath = "$InstallDir\run.bat"
+    $sc.WorkingDirectory = $InstallDir
+    $sc.Description = "ThermopacStructuringAgent — SolidWorks Drawing Structuring Agent"
+    $sc.Save()
+    Write-OK "Desktop shortcut created"
+} catch {
+    Write-Warn "Could not create Desktop shortcut: $_"
+}
+
+# ── Step 14: Optional scheduled task ─────────────────────────────────────────
 if (-not $Silent) {
     Write-Host ""
     $ans = Read-Host "Create scheduled task to auto-start agent at Windows login? [y/N]"
@@ -558,7 +438,7 @@ if (-not $Silent) {
         $taskXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>ThermopacAgent SolidWorks Extraction Service</Description></RegistrationInfo>
+  <RegistrationInfo><Description>ThermopacStructuringAgent SolidWorks Drawing Structuring Service</Description></RegistrationInfo>
   <Triggers><LogonTrigger><Delay>PT30S</Delay><Enabled>true</Enabled></LogonTrigger></Triggers>
   <Principals><Principal runLevel="highestAvailable"><GroupId>S-1-5-32-545</GroupId></Principal></Principals>
   <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
@@ -568,8 +448,8 @@ if (-not $Silent) {
   </Exec></Actions>
 </Task>
 "@
-        $taskXml | Set-Content "$env:TEMP\ThermopacAgent-task.xml" -Encoding Unicode
-        schtasks /Create /F /XML "$env:TEMP\ThermopacAgent-task.xml" /TN "ThermopacAgent" 2>&1 | Out-Null
+        $taskXml | Set-Content "$env:TEMP\ThermopacStructurer-task.xml" -Encoding Unicode
+        schtasks /Create /F /XML "$env:TEMP\ThermopacStructurer-task.xml" /TN "ThermopacStructuringAgent" 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) { Write-OK "Scheduled task created (starts 30s after login)" }
         else { Write-Warn "Scheduled task creation failed (non-fatal)" }
     }
@@ -578,28 +458,28 @@ if (-not $Silent) {
 # ── Summary ───────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Green
-Write-Host "  INSTALLATION COMPLETE — ThermopacAgent v$AGENT_VERSION" -ForegroundColor Green
+Write-Host "  INSTALLATION COMPLETE — ThermopacStructuringAgent v$AGENT_VERSION" -ForegroundColor Green
 Write-Host "============================================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Install directory : $InstallDir" -ForegroundColor White
-Write-Host "  Data directory    : $DataDir" -ForegroundColor White
+Write-Host "  Data directory    : $DataDir"    -ForegroundColor White
+Write-Host "  Staging root      : $StagingRoot" -ForegroundColor White
 Write-Host "  Config file       : $config_path" -ForegroundColor White
-Write-Host "  SolidWorks        : $sw_progid" -ForegroundColor White
-Write-Host "  Python            : $PyExe" -ForegroundColor White
+Write-Host "  SolidWorks        : $sw_progid"  -ForegroundColor White
+Write-Host "  Python            : $PyExe"      -ForegroundColor White
 Write-Host ""
 Write-Host "  NEXT STEPS:" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  1. Edit config.ini:" -ForegroundColor Yellow
-Write-Host "       $config_path" -ForegroundColor White
-Write-Host "     Set [cloud] api_url to your Thermopac ERP URL" -ForegroundColor White
-Write-Host "     In testing mode: node_token is auto-generated (leave as-is)" -ForegroundColor White
-Write-Host "     In production mode: paste admin-issued node_token" -ForegroundColor White
+Write-Host "  1. Edit config.ini and set:" -ForegroundColor Yellow
+Write-Host "       [cloud]  node_id, node_token" -ForegroundColor White
+Write-Host "       [structurer]  template_path  <- REQUIRED" -ForegroundColor White
 Write-Host ""
-Write-Host "  2. Run the agent:" -ForegroundColor Yellow
-Write-Host "       $InstallDir\run.bat" -ForegroundColor White
-Write-Host "     Or: Start Menu > ThermopacAgent" -ForegroundColor White
+Write-Host "  2. Launch the agent:" -ForegroundColor Yellow
+Write-Host "       Start Menu > ThermopacStructuringAgent" -ForegroundColor White
+Write-Host "       OR Desktop shortcut: SolidWorks Structuring Agent" -ForegroundColor White
 Write-Host ""
-Write-Host "  3. If SolidWorks COM errors occur, run:" -ForegroundColor Yellow
-Write-Host "       $InstallDir\makepy-repair.bat" -ForegroundColor White
+Write-Host "  3. If COM errors appear:" -ForegroundColor Yellow
+Write-Host "       Start Menu > ThermopacStructuringAgent > Repair COM Cache" -ForegroundColor White
 Write-Host ""
-if (-not $Silent) { Read-Host "Press Enter to close" }
+
+if (-not $Silent) { Read-Host "Press Enter to exit" }

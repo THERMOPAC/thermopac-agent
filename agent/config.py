@@ -1,23 +1,22 @@
 """
-config.py — Load, auto-create, and validate config.ini.
+config.py — Read and validate config.ini.
+
+DESIGN RULES
+────────────
+1. config.ini passed at startup is READ-ONLY — never written to.
+2. If config.ini is missing → hard exit with clear instructions.
+3. No auto-migration of URLs, no overwriting of any field.
+4. The ONLY write this module performs is persisting an auto-generated
+   node_token (testing mode only) to the user-writable APPDATA path:
+     %APPDATA%\\ThermopacStructuringAgent\\config.ini
+   This write never touches the primary config path.
 
 MODES
 ─────
-testing    (default)
-  • If node_token is missing/placeholder, a random token is auto-generated
-    and saved into config.ini.
-  • Agent then calls POST /api/epc-agent-nodes/auto-register so the cloud
-    accepts the self-issued token.  The cloud endpoint must have
-    AGENT_AUTO_REGISTER=true set in its environment.
-
-production
-  • node_token must be cloud/admin-issued.  Missing token → hard exit with
-    step-by-step instructions.  No token is ever auto-generated.
-
-OTHER AUTO-FILLS (both modes)
-  api_url             → current Replit Development URL (edit for production)
-  node_id             → socket.gethostname()   (Windows machine name)
-  solidworks_version  → highest version found in Windows registry (if set to 0)
+testing    → node_token may be auto-generated if absent/placeholder.
+             Token is written to APPDATA config, not to the primary path.
+production → node_token must be present and non-placeholder.
+             Missing token → hard exit with step-by-step instructions.
 """
 
 from __future__ import annotations
@@ -37,8 +36,14 @@ SW_VERSION_PROGID = {
 }
 
 _TOKEN_PLACEHOLDER = "REPLACE_WITH_YOUR_TOKEN"
-_DEFAULT_API_URL   = "https://5d05ae61-8225-4651-bb76-b4e20a4ddabb-00-3mex6zlihlmft.janeway.replit.dev"
-_LEGACY_PROD_API_URL = "https://thermopac-communication-thermopacllp.replit.app"
+
+# User-writable path for persisting auto-generated tokens (testing mode).
+# This is the ONLY path this module ever writes to.
+_APPDATA_CONFIG = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")),
+    "ThermopacStructuringAgent",
+    "config.ini",
+)
 
 
 class AgentConfig:
@@ -46,58 +51,95 @@ class AgentConfig:
         if path is None:
             path = self._default_path()
 
-        # Auto-create config.ini if missing at the single canonical path
+        # ── config.ini must exist — no auto-create ─────────────────────────
         if not os.path.exists(path):
-            _create_default_config(path)
+            print()
+            print("=" * 62)
+            print("  ERROR: config.ini not found")
+            print("=" * 62)
+            print()
+            print(f"  Expected location: {path}")
+            print()
+            print("  Create config.ini in the same folder as run.bat.")
+            print("  Minimum required contents:")
+            print()
+            print("    [cloud]")
+            print("    api_url    = https://thermopac-communication-thermopacllp.replit.app")
+            print(f"    node_id    = {socket.gethostname()}")
+            print("    node_token = REPLACE_WITH_YOUR_TOKEN")
+            print()
+            print("    [agent]")
+            print("    mode = testing")
+            print()
+            print("    [structurer]")
+            print("    template_path = C:\\SolidWorks Templates\\Standard_A1.drwdot")
+            print("    staging_root  = C:\\ThermopacStaging\\drawings")
+            print()
+            sys.exit(1)
 
-        print(f"[CONFIG] Loaded from: {path}")
+        print(f"[CONFIG] Loaded from: {path}  (read-only)")
 
         cfg = configparser.ConfigParser()
         cfg.read(path, encoding="utf-8")
 
-        # Dev test build: migrate the old published URL to the current Development backend.
-        _early_api_url = (
-            cfg.get("cloud", "api_url", fallback="").strip().rstrip("/")
-            or _DEFAULT_API_URL
-        )
-        if _early_api_url == _LEGACY_PROD_API_URL:
-            _early_api_url = _DEFAULT_API_URL
-            _save_api_url(cfg, path, _early_api_url)
-            print("[CONFIG] Dev build: migrated api_url from published backend to Development backend")
-        print(f"[CONFIG] api_url:      {_early_api_url}")
+        # ── Also read APPDATA overlay (token written by testing mode) ───────
+        appdata_cfg = configparser.ConfigParser()
+        if os.path.exists(_APPDATA_CONFIG):
+            try:
+                appdata_cfg.read(_APPDATA_CONFIG, encoding="utf-8-sig")
+                print(f"[CONFIG] Token overlay:  {_APPDATA_CONFIG}")
+            except Exception:
+                # Corrupted APPDATA config — delete it and start fresh
+                print(f"[CONFIG] WARNING: APPDATA config is corrupted — deleting and ignoring.")
+                try:
+                    os.remove(_APPDATA_CONFIG)
+                except Exception:
+                    pass
+                appdata_cfg = configparser.ConfigParser()
 
-        # ── Mode ──────────────────────────────────────────────────────────────
+        # ── Mode — APPDATA overlay takes priority (no admin rights needed) ───
         raw_mode = cfg.get("agent", "mode", fallback="testing").strip().lower()
+        appdata_mode = appdata_cfg.get("agent", "mode", fallback="").strip().lower()
+        if appdata_mode in ("testing", "production"):
+            raw_mode = appdata_mode
+            print(f"[CONFIG] Mode override from APPDATA: {raw_mode}")
         if raw_mode not in ("testing", "production"):
             print(f"[CONFIG] ERROR: [agent] mode must be 'testing' or 'production', got '{raw_mode}'")
             sys.exit(1)
         self.mode = raw_mode
 
         # ── Cloud ─────────────────────────────────────────────────────────────
-        self.api_url = (
-            cfg.get("cloud", "api_url", fallback="").strip().rstrip("/")
-            or _DEFAULT_API_URL
-        )
+        self.api_url = cfg.get("cloud", "api_url", fallback="").strip().rstrip("/")
+        # APPDATA overlay may override api_url (useful in dev/testing to avoid
+        # editing the read-only Program Files config.ini as administrator)
+        appdata_api_url = appdata_cfg.get("cloud", "api_url", fallback="").strip().rstrip("/")
+        if appdata_api_url:
+            self.api_url = appdata_api_url
+            print(f"[CONFIG] api_url override from APPDATA: {self.api_url}")
+        if not self.api_url:
+            print("[CONFIG] ERROR: [cloud] api_url is required in config.ini")
+            sys.exit(1)
 
         self.node_id = (
             cfg.get("cloud", "node_id", fallback="").strip()
             or socket.gethostname()
         )
 
+        # Token: primary config first, then APPDATA overlay
         raw_token = cfg.get("cloud", "node_token", fallback="").strip()
+        if not raw_token or raw_token == _TOKEN_PLACEHOLDER:
+            raw_token = appdata_cfg.get("cloud", "node_token", fallback="").strip()
+
         self.token_auto_generated = False
 
         if not raw_token or raw_token == _TOKEN_PLACEHOLDER:
             if self.mode == "production":
                 _abort_missing_token(path, self.node_id)
             else:
-                # testing mode — generate, persist, flag for auto-registration
+                # Testing mode — generate in memory, persist to APPDATA only
                 raw_token = secrets.token_hex(32)
-                _save_token(cfg, path, raw_token)
                 self.token_auto_generated = True
-                print(f"[CONFIG] Testing mode: auto-generated node_token and saved to config.ini")
-                print(f"[CONFIG] Agent will self-register with the cloud on startup.")
-                print()
+                _persist_token_to_appdata(raw_token, self.node_id, self.api_url)
 
         self.node_token = raw_token
 
@@ -111,6 +153,14 @@ class AgentConfig:
         self.log_dir  = cfg.get("paths", "log_dir",  fallback=r"C:\ThermopacAgent\logs")
         os.makedirs(self.temp_dir, exist_ok=True)
         os.makedirs(self.log_dir,  exist_ok=True)
+
+        # ── Structurer ────────────────────────────────────────────────────────
+        self.structurer_template_path = cfg.get(
+            "structurer", "template_path", fallback=""
+        ).strip()
+        self.structurer_staging_root = cfg.get(
+            "structurer", "staging_root", fallback=r"C:\ThermopacStaging\drawings"
+        ).strip()
 
         # ── SolidWorks ────────────────────────────────────────────────────────
         self.sw_visible = cfg.getboolean("solidworks", "visible", fallback=False)
@@ -144,6 +194,15 @@ class AgentConfig:
 
         self._config_path = path
 
+        # ── Summary print ─────────────────────────────────────────────────────
+        print(f"[CONFIG] api_url:      {self.api_url}")
+        print(f"[CONFIG] node_id:      {self.node_id}")
+        print(f"[CONFIG] mode:         {self.mode}")
+        sw = self.sw_progid or "NOT DETECTED"
+        if self.sw_autodetected and self.sw_progid:
+            sw += " [auto-detected]"
+        print(f"[CONFIG] solidworks:   {sw}")
+
     # ── Public ────────────────────────────────────────────────────────────────
 
     def summary(self) -> str:
@@ -158,20 +217,19 @@ class AgentConfig:
     @staticmethod
     def _default_path() -> str:
         """
-        Single source of truth for config location.
+        Default config path: same folder as the script / executable.
 
-        Frozen (installed EXE):
-          → same folder as ThermopacAgent.exe
-          → e.g. C:\\Program Files\\ThermopacAgent\\config.ini
+        Frozen (Inno Setup install):
+          sys.executable = C:\\Program Files\\ThermopacStructuringAgent\\python\\python.exe
+          → C:\\Program Files\\ThermopacStructuringAgent\\config.ini
 
-        Source / dev:
-          → project root (parent of the agent/ package)
+        Source / ZIP extract:
+          __file__ = <extract>\\agent\\config.py
+          → <extract>\\config.ini
         """
         if getattr(sys, "frozen", False):
-            # sys.executable = C:\Program Files\ThermopacAgent\ThermopacAgent.exe
             base = os.path.dirname(sys.executable)
         else:
-            # __file__ = <project>/agent/config.py  →  parent = <project>/
             base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return os.path.normpath(os.path.join(base, "config.ini"))
 
@@ -193,81 +251,29 @@ def _detect_solidworks_version() -> int:
     return 0
 
 
-def _save_token(cfg: configparser.ConfigParser, path: str, token: str) -> None:
-    """Write the generated token back into config.ini under [cloud] node_token."""
-    if not cfg.has_section("cloud"):
-        cfg.add_section("cloud")
-    cfg.set("cloud", "node_token", token)
-    with open(path, "w", encoding="utf-8") as f:
-        cfg.write(f)
-
-
-def _save_api_url(cfg: configparser.ConfigParser, path: str, api_url: str) -> None:
-    """Write the API URL back into config.ini under [cloud] api_url."""
-    if not cfg.has_section("cloud"):
-        cfg.add_section("cloud")
-    cfg.set("cloud", "api_url", api_url)
-    with open(path, "w", encoding="utf-8") as f:
-        cfg.write(f)
-
-
-def _create_default_config(path: str) -> None:
-    """Create a starter config.ini with auto-filled values."""
-    machine_name = socket.gethostname()
-    detected_ver = _detect_solidworks_version()
-    sw_ver_str   = str(detected_ver) if detected_ver else "0"
-    sw_comment   = (
-        f"; Auto-detected SolidWorks {detected_ver}"
-        if detected_ver
-        else "; SolidWorks not detected — set manually (2019–2024)"
-    )
-
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    content = f"""\
-; ThermopacAgent configuration
-; Auto-created on first run
-
-[cloud]
-api_url    = {_DEFAULT_API_URL}
-node_id    = {machine_name}
-node_token = {_TOKEN_PLACEHOLDER}
-
-[agent]
-; testing | production
-; testing  — auto-generates token and self-registers with cloud
-; production — requires cloud/admin-issued token, no auto-registration
-mode = testing
-
-poll_interval_sec = 10
-job_timeout_sec   = 600
-max_retries       = 3
-
-[paths]
-temp_dir = C:\\ThermopacAgent\\temp
-log_dir  = C:\\ThermopacAgent\\logs
-
-[solidworks]
-{sw_comment}
-solidworks_version = {sw_ver_str}
-; solidworks_progid =
-visible = false
-
-; Semicolon-separated list of root folders where SolidWorks should search for
-; referenced parts and assemblies when opening drawings.
-; Required for full-mode open when parts are NOT in the same folder as the drawing.
-; Example:  C:\\SolidWorks Projects;D:\\CAD Vault
-model_search_path =
-"""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    print(f"[CONFIG] Created default config.ini at: {path}")
-    print(f"[CONFIG]   node_id    = {machine_name}  (from machine name)")
-    print(f"[CONFIG]   api_url    = {_DEFAULT_API_URL}  (default)")
-    if detected_ver:
-        print(f"[CONFIG]   solidworks = {detected_ver}  (auto-detected)")
-    else:
-        print(f"[CONFIG]   solidworks = not detected — set solidworks_version manually")
+def _persist_token_to_appdata(token: str, node_id: str, api_url: str) -> None:
+    """
+    Persist an auto-generated token to the user-writable APPDATA config.
+    This is the ONLY write operation in this module.
+    Primary config.ini (in Program Files or install dir) is never touched.
+    """
+    try:
+        os.makedirs(os.path.dirname(_APPDATA_CONFIG), exist_ok=True)
+        c = configparser.ConfigParser()
+        if os.path.exists(_APPDATA_CONFIG):
+            c.read(_APPDATA_CONFIG, encoding="utf-8")
+        if not c.has_section("cloud"):
+            c.add_section("cloud")
+        c.set("cloud", "node_token", token)
+        c.set("cloud", "node_id",    node_id)
+        c.set("cloud", "api_url",    api_url)
+        with open(_APPDATA_CONFIG, "w", encoding="utf-8") as f:
+            c.write(f)
+        print(f"[CONFIG] Testing mode: auto-generated token saved to:")
+        print(f"[CONFIG]   {_APPDATA_CONFIG}")
+        print(f"[CONFIG]   Agent will self-register with the cloud on startup.")
+    except Exception as e:
+        print(f"[CONFIG] Testing mode: auto-generated token (in memory only — could not save: {e})")
     print()
 
 
