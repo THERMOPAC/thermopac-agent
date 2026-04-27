@@ -359,10 +359,11 @@ def _detect_preopened_dependencies(swApp, reference_diagnostics: dict, logger) -
 # ── Target properties for Layer 1 extraction ──────────────────────────────────
 _TARGET_PROPERTIES = [
     "HYDRO_TEST_POSITION",
-    "SHELL_IDP", "SHELL_MOT",
-    "TUBE_IDP",  "TUBE_MOT",
-    "JACKET_IDP", "JACKET_MOT",
-    "Drawing_Number", "Tag_No", "Equipment_Type", "Equipment_Configuration",
+    "SHELL_WP", "SHELL_IDP", "SHELL_MOT",
+    "TUBE_WP",  "TUBE_IDP",  "TUBE_MOT",
+    "JACKET_WP", "JACKET_IDP", "JACKET_MOT",
+    "Drawing_Number", "Tag_No", "Serial_No",
+    "Description", "Equipment_Type", "Equipment_Configuration",
     "Design_Code", "Material_Code", "Inspection_By",
     "DrawnBy", "DrawnDate", "CheckedBy", "CheckedDate",
     "EngineeringApproval", "EngAppDate",

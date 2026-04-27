@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Agent version (e.g. 1.0.0)'
+        description: 'Agent version (e.g. 1.0.70)'
         required: true
-        default: '1.0.0'
+        default: '1.0.70'
   push:
     paths:
       - 'agent/**'

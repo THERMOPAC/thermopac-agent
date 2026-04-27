@@ -17,7 +17,7 @@ import requests
 
 from agent.job_client import _AuthError, _ConflictError, _ValidationError
 
-STRUCTURER_VERSION = "1.0.24"
+STRUCTURER_VERSION = "1.0.25"
 
 
 class StructureJobClient:

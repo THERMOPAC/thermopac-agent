@@ -1,132 +1,108 @@
-; ============================================================
-; Thermopac Drawing Structuring Agent — Inno Setup 6 script
-; Version: read from STRUCTURER_VERSION env var at compile time
+; ThermopacAgent — Inno Setup 6 installer script
+; Compile with: iscc setup.iss   (from the installer\ directory)
 ;
-; Compile with:
-;   iscc installer\setup.iss                (from structurer_pkg\ directory)
-;   OR
-;   installer\build-installer.bat           (full pipeline — builds dist first)
-;   OR (CI)
-;   set STRUCTURER_VERSION=1.0.24 && iscc installer\setup.iss
+; Build pipeline:
+;   1. build-installer.bat        — downloads Python embeddable, pip install, makepy
+;   2. iscc installer\setup.iss   — packages everything into a single .exe installer
 ;
-; Prerequisites:
+; Requires:
 ;   - Inno Setup 6.x  https://jrsoftware.org/isinfo.php
-;   - dist\ThermopacStructuringAgent\  built by build-installer.bat
-;   - dist\python\                     bundled Python (built by build-installer.bat)
-; ============================================================
+;   - dist\ThermopacAgent\  folder built by build-installer.bat
+;   - dist\python\          Python 3.11 embeddable (downloaded by build-installer.bat)
 
-#define MyAppVersion        GetEnv("STRUCTURER_VERSION")
-#if MyAppVersion == ""
-  #define MyAppVersion      "1.0.24"
-#endif
-
-#define AppName             "ThermopacStructuringAgent"
+#define AppName             "ThermopacAgent Dev"
+#define AppVersion          "1.0.70"
 #define AppPublisher        "Thermopac"
-#define DesktopShortcutName "SolidWorks Structuring Agent"
-#define AppURL              "https://thermopac-communication-thermopacllp.replit.app"
-#define AppExeName          "run.bat"
-
-; SourcePath = directory containing this .iss file (installer\)
-; AgentRoot  = repo root (one level up from installer\)
-; SourceDir  = dist\ThermopacStructuringAgent\  (built by build-installer.bat)
-; PythonDir  = dist\python\
-#define AgentRoot  SourcePath + ".."
-#define SourceDir  AgentRoot + "\dist\ThermopacStructuringAgent"
-#define PythonDir  AgentRoot + "\dist\python"
+#define DesktopShortcutName "SolidWorks Extraction Agent"
+#define AppURL       "https://5d05ae61-8225-4651-bb76-b4e20a4ddabb-00-3mex6zlihlmft.janeway.replit.dev"
+#define AppExeName   "run.bat"
+; SourcePath is an InnoSetup built-in: the directory containing this .iss file
+; (always local-agent\installer\). Using it avoids CWD-relative path bugs
+; when ISCC is invoked from a different working directory (e.g. the repo root
+; or local-agent\ in GitHub Actions).
+#define AgentRoot    SourcePath + "\.."
+#define SourceDir    AgentRoot + "\dist\ThermopacAgent"
+#define PythonDir    AgentRoot + "\dist\python"
 
 [Setup]
-; New GUID — must differ from the Extraction Agent's GUID
-AppId={{A7C4D2F1-9B3E-4E8A-B5F2-31D6C08EF450}
+AppId={{B06B4460-8C38-4705-97DC-71E9C1E5D936}
 AppName={#AppName}
-AppVersion={#MyAppVersion}
+AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
 AppPublisherURL={#AppURL}
-; Install alongside (not replacing) the Extraction Agent
-DefaultDirName={autopf}\ThermopacStructuringAgent
+DefaultDirName={autopf}\ThermopacAgentDev
 DefaultGroupName={#AppName}
 AllowNoIcons=yes
-; OutputDir is relative to this .iss file location (installer\)
-; ..\installer_output resolves to installer_output\ at repo root
-OutputDir=..\installer_output
-OutputBaseFilename=ThermopacStructuringAgent-Setup-v{#MyAppVersion}
+OutputDir={#AgentRoot}\installer_output
+OutputBaseFilename=ThermopacAgent-Setup-v{#AppVersion}
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64
 UninstallDisplayIcon={app}\run.bat
-UninstallDisplayName={#AppName} v{#MyAppVersion}
+UninstallDisplayName={#AppName}
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon";     Description: "Create a &desktop shortcut";                GroupDescription: "Additional icons:"
-Name: "startmenuicon";   Description: "Create a &Start Menu shortcut";             GroupDescription: "Additional icons:"
-Name: "startupschedule"; Description: "Start agent automatically at &Windows login"; GroupDescription: "Auto-start:"
+Name: "desktopicon";      Description: "Create a &desktop shortcut";               GroupDescription: "Additional icons:"
+Name: "startmenuicon";    Description: "Create a &Start Menu shortcut";            GroupDescription: "Additional icons:"
+Name: "startupschedule";  Description: "Start agent automatically at &Windows login"; GroupDescription: "Auto-start:"
 
 [Files]
-; ── Agent Python source (agent/ extractor/ structurer/ from dist\ThermopacStructuringAgent\)
+; Agent EXE + supporting files (PyInstaller output)
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-
-; ── Bundled Python runtime (optional — skipped if dist\python\ not present)
-; When present the installer is fully self-contained.
-; When absent, setup.ps1 downloads Python from python.org at install time.
+; Bundled Python runtime — optional.  If dist\python\ was not created at build time
+; (e.g. a CI run without the embeddable download step) ISCC skips this entry safely.
+; When present the installer is fully self-contained; when absent setup.ps1 downloads
+; Python from python.org at install time.
 Source: "{#PythonDir}\*"; DestDir: "{app}\python"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
-
-; ── Launch scripts (installer\ folder — not part of agent source)
-Source: "{#SourcePath}run-service.bat";  DestDir: "{app}"; Flags: ignoreversion
+; Launch scripts (not part of PyInstaller output — must be listed explicitly)
+Source: "{#SourcePath}run.bat";           DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}run-service.bat";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}makepy-repair.bat"; DestDir: "{app}"; Flags: ignoreversion
-
-; ── PowerShell bootstrap (fetches Python at install time if not bundled)
+; PowerShell bootstrap — always bundled so Python can be fetched if not pre-bundled
 Source: "{#SourcePath}setup.ps1"; DestDir: "{app}"; Flags: ignoreversion
-
-; ── Default config — users edit after installation; never overwrite existing
+; Default config — users edit this after installation
 Source: "{#AgentRoot}\config.ini"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
 
-; ── run.bat — placed at app root; built by build-installer.bat and listed here explicitly
-Source: "{#AgentRoot}\run.bat"; DestDir: "{app}"; Flags: ignoreversion
-
-; ── APPDATA auto-fix script — run.bat calls this on every startup
-Source: "{#AgentRoot}\fix_appdata_url.ps1"; DestDir: "{app}"; Flags: ignoreversion
-
 [Dirs]
-; Staging root — writable by all users
-Name: "{commonappdata}\ThermopacStructurer\temp"; Permissions: everyone-full
-Name: "{commonappdata}\ThermopacStructurer\logs"; Permissions: everyone-full
-; Staging output (default — users may override in config.ini)
-Name: "C:\ThermopacStaging\drawings"; Permissions: everyone-full
+Name: "{commonappdata}\ThermopacAgentDev\temp";   Permissions: everyone-full
+Name: "{commonappdata}\ThermopacAgentDev\logs";   Permissions: everyone-full
+Name: "{commonappdata}\ThermopacAgentDev\config"; Permissions: everyone-full
 
 [Icons]
-; ── Start Menu group (always created)
-Name: "{group}\{#AppName}";              Filename: "{app}\run.bat";            WorkingDir: "{app}"
-Name: "{group}\Edit Config";             Filename: "notepad.exe";              Parameters: """{app}\config.ini"""
-Name: "{group}\Repair COM Cache";        Filename: "{app}\makepy-repair.bat";  WorkingDir: "{app}"
-Name: "{group}\Uninstall {#AppName}";    Filename: "{uninstallexe}"
-; ── Named Start Menu shortcut (task-controlled)
-Name: "{group}\{#DesktopShortcutName}";  Filename: "{app}\run.bat";           WorkingDir: "{app}"; Tasks: startmenuicon
-; ── Desktop shortcut (task-controlled)
-Name: "{autodesktop}\{#DesktopShortcutName}"; Filename: "{app}\run.bat";      WorkingDir: "{app}"; Tasks: desktopicon
+; Start Menu group entries (always created)
+Name: "{group}\{#AppName}";                  Filename: "{app}\run.bat";           WorkingDir: "{app}"
+Name: "{group}\Edit Config";                 Filename: "notepad.exe";             Parameters: """{app}\config.ini"""
+Name: "{group}\Repair COM Cache";            Filename: "{app}\makepy-repair.bat"; WorkingDir: "{app}"
+Name: "{group}\Uninstall {#AppName}";        Filename: "{uninstallexe}"
+; Named Start Menu shortcut (task-controlled, checked by default)
+Name: "{group}\{#DesktopShortcutName}";      Filename: "{app}\run.bat";           WorkingDir: "{app}"; Tasks: startmenuicon
+; Desktop shortcut (task-controlled, checked by default)
+Name: "{autodesktop}\{#DesktopShortcutName}"; Filename: "{app}\run.bat";          WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\run.bat"; Description: "Launch {#AppName} now"; Flags: nowait postinstall skipifsilent unchecked shellexec
 
 [Code]
 
-// ── SolidWorks detection ──────────────────────────────────────────────────────
+// ── SolidWorks detection ──────────────────────────────────────────────────
 function DetectSwProgId(): String;
 var
-  Suffixes: array of String;
+  Years: array of String;
   i: Integer;
   Dummy: String;
 begin
   Result := '';
-  Suffixes := ['32','31','30','29','28','27'];
-  for i := 0 to GetArrayLength(Suffixes) - 1 do
+  Years := ['32','31','30','29','28','27'];
+  for i := 0 to GetArrayLength(Years) - 1 do
   begin
-    if RegQueryStringValue(HKCR, 'SldWorks.Application.' + Suffixes[i], '', Dummy) then
+    if RegQueryStringValue(HKCR, 'SldWorks.Application.' + Years[i], '', Dummy) then
     begin
-      Result := 'SldWorks.Application.' + Suffixes[i];
+      Result := 'SldWorks.Application.' + Years[i];
       Exit;
     end;
   end;
@@ -137,7 +113,7 @@ begin
   Result := DetectSwProgId() <> '';
 end;
 
-// ── makepy: pre-generate win32com COM type library cache ─────────────────────
+// ── makepy: generate win32com early-binding cache ─────────────────────────
 procedure RunMakepy(ProgId: String);
 var
   PyExe, Args: String;
@@ -146,25 +122,29 @@ begin
   PyExe := ExpandConstant('{app}\python\python.exe');
   if not FileExists(PyExe) then
   begin
-    MsgBox(
-      'Python not found at ' + PyExe + ' — skipping COM cache setup.' + #13#10 +
-      'Run "Repair COM Cache" from the Start Menu after installation.',
-      mbError, MB_OK);
+    MsgBox('Python not found at ' + PyExe + ' — skipping COM cache setup.' + #13#10 +
+           'Run "Repair COM Cache" from the Start Menu after installation.',
+           mbError, MB_OK);
     Exit;
   end;
 
   // Method A: standard makepy via ProgID
   Args := '-m win32com.client.makepy "' + ProgId + '"';
   Exec(PyExe, Args, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  if ResultCode = 0 then Exit;
+  if ResultCode = 0 then
+    Exit;
 
-  // Method B: gencache EnsureDispatch (last resort)
-  Args := '-c "import win32com.client.gencache as g; g.EnsureDispatch(''' + ProgId + ''')"';
+  // Method B: inline pythoncom registry walk (same logic as _prepare_sw_makepy_cache)
+  Args := '-c "import winreg,pythoncom,win32com.client.gencache as g,sys; ' +
+          'p=sys.argv[1]; ' +
+          'k=winreg.OpenKey(winreg.HKEY_CLASSES_ROOT,p+chr(92)+chr(67)+chr(76)+chr(83)+chr(73)+chr(68)); ' +
+          'c=winreg.QueryValue(k,chr(0)); winreg.CloseKey(k); ' +
+          'print(chr(79)+chr(75))" "' + ProgId + '"';
   Exec(PyExe, Args, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  // Non-fatal — agent has its own 3-method DispatchEx fallback at runtime
+  // Non-fatal — agent has its own 3-method fallback at runtime
 end;
 
-// ── Scheduled task ───────────────────────────────────────────────────────────
+// ── Scheduled task ────────────────────────────────────────────────────────
 procedure CreateScheduledTask();
 var
   ResultCode: Integer;
@@ -172,37 +152,35 @@ begin
   if IsTaskSelected('startupschedule') then
   begin
     Exec('schtasks.exe',
-      '/Create /F /SC ONLOGON /RL HIGHEST /TN "ThermopacStructuringAgent" /TR "\"' +
+      '/Create /F /SC ONLOGON /RL HIGHEST /TN "ThermopacAgentDev" /TR "\"' +
       ExpandConstant('{app}') + '\run-service.bat\"" /DELAY 0000:30',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     if ResultCode = 0 then
-      MsgBox(
-        'Scheduled task created: ThermopacStructuringAgent starts 30 seconds after login.',
-        mbInformation, MB_OK)
+      MsgBox('Scheduled task created: ThermopacAgentDev starts 30s after login.',
+             mbInformation, MB_OK)
     else
-      MsgBox(
-        'Warning: Could not create scheduled task (code ' + IntToStr(ResultCode) + '). ' +
-        'Start from the Start Menu manually.', mbError, MB_OK);
+      MsgBox('Warning: Could not create scheduled task (code ' + IntToStr(ResultCode) + '). ' +
+             'Start from the Start Menu manually.', mbError, MB_OK);
   end;
 end;
 
-// ── Pre-install validation ───────────────────────────────────────────────────
+// ── Validation ────────────────────────────────────────────────────────────
 function InitializeSetup(): Boolean;
 begin
   Result := True;
   if not CheckSolidWorks() then
   begin
     MsgBox(
-      'SolidWorks (2019–2024) was not detected on this machine.' + #13#10 + #13#10 +
-      'ThermopacStructuringAgent requires SolidWorks to be installed and licensed.' + #13#10 +
+      'SolidWorks (2019-2024) was not detected on this machine.' + #13#10 + #13#10 +
+      'ThermopacAgent requires SolidWorks to be installed.' + #13#10 +
       'Please install SolidWorks first, then re-run this installer.' + #13#10 + #13#10 +
-      'Click OK to cancel.',
+      'Click OK to cancel installation.',
       mbCriticalError, MB_OK);
     Result := False;
   end;
 end;
 
-// ── Post-install ─────────────────────────────────────────────────────────────
+// ── Post-install ──────────────────────────────────────────────────────────
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ProgId: String;
@@ -214,7 +192,7 @@ begin
     PyExe := ExpandConstant('{app}\python\python.exe');
     Ps1   := ExpandConstant('{app}\setup.ps1');
 
-    // If Python was NOT bundled, run setup.ps1 to download it
+    // If Python was NOT bundled by the installer, run setup.ps1 to fetch it
     if not FileExists(PyExe) then
     begin
       if FileExists(Ps1) then
@@ -222,8 +200,7 @@ begin
         MsgBox(
           'Python was not bundled in this installer.' + #13#10 +
           'setup.ps1 will now download Python 3.11 from python.org.' + #13#10 + #13#10 +
-          'A PowerShell window will open — leave it running until complete.' + #13#10 +
-          'This requires internet access.',
+          'A PowerShell window will open — leave it running until complete.',
           mbInformation, MB_OK);
         Exec('powershell.exe',
           '-ExecutionPolicy Bypass -File "' + Ps1 + '"',
@@ -231,51 +208,37 @@ begin
       end else
         MsgBox(
           'Python not found and setup.ps1 is missing.' + #13#10 +
-          'Re-run the installer or run bootstrap.bat manually.',
-          mbError, MB_OK);
+          'Run "Repair COM Cache" from the Start Menu after placing setup.ps1 in ' +
+          ExpandConstant('{app}') + '.', mbError, MB_OK);
     end else
     begin
-      // Python IS bundled — pre-generate makepy cache for detected SolidWorks
+      // Python IS bundled — run makepy for the detected SolidWorks version
       ProgId := DetectSwProgId();
       if ProgId <> '' then
         RunMakepy(ProgId);
     end;
 
-    // Force mode = testing in config.ini (works on fresh install AND upgrade)
-    // SetIniString writes without BOM using Windows API — no manual edit needed
-    SetIniString('agent', 'mode', 'testing', ExpandConstant('{app}\config.ini'));
-
-    // ── Fix APPDATA api_url → dev server (no admin needed, user's APPDATA) ──
-    // Creates the APPDATA dir if missing, then upserts the api_url key.
-    // Preserves node_token and all other existing keys.
-    ForceDirectories(ExpandConstant('{userappdata}\ThermopacStructuringAgent'));
-    SetIniString('cloud', 'api_url',
-      'https://5d05ae61-8225-4651-bb76-b4e20a4ddabb-00-3mex6zlihlmft.janeway.replit.dev',
-      ExpandConstant('{userappdata}\ThermopacStructuringAgent\config.ini'));
-
     CreateScheduledTask();
 
     MsgBox(
       'Installation complete!' + #13#10 + #13#10 +
-      'NEXT STEPS:' + #13#10 + #13#10 +
-      '  1. Edit config.ini in the install folder:' + #13#10 +
-      '       ' + ExpandConstant('{app}') + '\config.ini' + #13#10 + #13#10 +
-      '     Required settings:' + #13#10 +
-      '       [cloud]   node_id, node_token' + #13#10 +
-      '       [structurer]  template_path  <-- MUST be set' + #13#10 + #13#10 +
-      '  2. Run "ThermopacStructuringAgent" from the Start Menu or Desktop.' + #13#10 + #13#10 +
+      'NEXT STEPS:' + #13#10 +
+      '  1. This Dev build installs side-by-side in ThermopacAgentDev' + #13#10 +
+      '     api_url is set to the Development backend' + #13#10 +
+      '     Testing mode: node_token is auto-generated if missing' + #13#10 +
+      '     Production mode: paste your admin-issued token' + #13#10 + #13#10 +
+      '  2. Run ThermopacAgent from the Start Menu' + #13#10 + #13#10 +
       '  3. If SolidWorks COM errors appear, run:' + #13#10 +
-      '       Start Menu > ThermopacStructuringAgent > Repair COM Cache',
+      '     Start Menu > ThermopacAgent Dev > Repair COM Cache',
       mbInformation, MB_OK);
   end;
 end;
 
-// ── Uninstall cleanup ────────────────────────────────────────────────────────
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ResultCode: Integer;
 begin
   if CurUninstallStep = usPostUninstall then
-    Exec('schtasks.exe', '/Delete /F /TN "ThermopacStructuringAgent"',
+    Exec('schtasks.exe', '/Delete /F /TN "ThermopacAgentDev"',
          '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
