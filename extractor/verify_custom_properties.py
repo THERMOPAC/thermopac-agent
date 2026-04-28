@@ -74,10 +74,15 @@ _ALLOWED_CONFIGS = {
 _BLANK_VALUES = frozenset(["", "-", "—", "n/a", "na", "none", "null"])
 
 _DATE_FORMATS = [
-    "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y",
-    "%Y/%m/%d", "%Y-%m-%d", "%Y.%m.%d",
-    "%d/%m/%y", "%d-%m-%y",
+    # M/D/YYYY first — matches SolidWorks custom-property format used at THERMOPAC
+    # (evidenced by "4/28/2026" which can only be M/D, never D/M)
     "%m/%d/%Y", "%m-%d-%Y",
+    # ISO
+    "%Y/%m/%d", "%Y-%m-%d", "%Y.%m.%d",
+    # D/M/YYYY fallback (older drawings / other engineers)
+    "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y",
+    "%d/%m/%y", "%d-%m-%y",
+    "%m/%d/%y",
     "%d %b %Y", "%d-%b-%Y", "%d %B %Y",
     "%b %d, %Y", "%B %d, %Y",
 ]
