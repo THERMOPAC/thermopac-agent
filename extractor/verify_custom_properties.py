@@ -49,6 +49,19 @@ import re
 from datetime import datetime, date
 
 
+# ─── Verification scope control ───────────────────────────────────────────────
+#
+# ENABLE_ONLY_SECTION_D = True
+#   → Only Section D fields are evaluated (DrawnBy, DrawnDate, CheckedBy,
+#     CheckedDate, EngineeringApproval, EngAppDate).
+#   → Sections A, B, C, E, F are skipped entirely.
+#   → Pass / Hold / Fail is determined solely by Section D results.
+#
+# ENABLE_ONLY_SECTION_D = False
+#   → Full verification (all sections A–F).
+#
+ENABLE_ONLY_SECTION_D = True
+
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 _ALLOWED_CONFIGS = {
@@ -587,7 +600,8 @@ def verify_custom_properties(cp_extraction: dict, logger=None) -> dict:
             except Exception:
                 pass
 
-    _log("[CPVerify] Layer 1 verification starting")
+    _active_scope = "Section D only" if ENABLE_ONLY_SECTION_D else "Full (Sections A–F)"
+    _log(f"[CPVerify] Layer 1 verification starting — scope: {_active_scope}")
 
     resolved: dict[str, dict] = (cp_extraction or {}).get("resolved") or {}
 
@@ -599,138 +613,140 @@ def verify_custom_properties(cp_extraction: dict, logger=None) -> dict:
 
     fields: list[dict] = []
     today = datetime.now().date()
+    # Default — overwritten by Section A when ENABLE_ONLY_SECTION_D=False
+    eq_cfg_display = "n/a (Section D only)" if ENABLE_ONLY_SECTION_D else "unknown"
 
-    # ── Section A: Equipment_Configuration (mandatory gate) ───────────────────
-    eq_cfg_raw = _val("Equipment_Configuration")
-    eq_cfg_src = _src("Equipment_Configuration")
-    # Fallback: Property Tab Builder templates often omit Equipment_Configuration
-    # as a separate field but include Equipment_Type with the same allowed values.
-    # If Equipment_Configuration is blank but Equipment_Type is a valid config
-    # string, promote it so downstream rules can resolve correctly.
-    if _is_blank(eq_cfg_raw):
-        eq_type_val = _val("Equipment_Type")
-        if not _is_blank(eq_type_val) and _norm_text(eq_type_val) in _ALLOWED_CONFIGS:
-            eq_cfg_raw = eq_type_val
-            eq_cfg_src = _src("Equipment_Type") + " (via Equipment_Type fallback)"
-    eq_cfg_norm = _norm_text(eq_cfg_raw)
-    eq_cfg_valid = eq_cfg_norm in _ALLOWED_CONFIGS
+    if not ENABLE_ONLY_SECTION_D:
+        # ── Section A: Equipment_Configuration (mandatory gate) ───────────────
+        eq_cfg_raw = _val("Equipment_Configuration")
+        eq_cfg_src = _src("Equipment_Configuration")
+        # Fallback: Property Tab Builder templates often omit Equipment_Configuration
+        # as a separate field but include Equipment_Type with the same allowed values.
+        # If Equipment_Configuration is blank but Equipment_Type is a valid config
+        # string, promote it so downstream rules can resolve correctly.
+        if _is_blank(eq_cfg_raw):
+            eq_type_val = _val("Equipment_Type")
+            if not _is_blank(eq_type_val) and _norm_text(eq_type_val) in _ALLOWED_CONFIGS:
+                eq_cfg_raw = eq_type_val
+                eq_cfg_src = _src("Equipment_Type") + " (via Equipment_Type fallback)"
+        eq_cfg_norm = _norm_text(eq_cfg_raw)
+        eq_cfg_valid = eq_cfg_norm in _ALLOWED_CONFIGS
 
-    if _is_blank(eq_cfg_raw):
-        fields.append(_missing("Equipment_Configuration"))
-        eq_cfg_display = "unknown"
-        config_hold = True
-    elif not eq_cfg_valid:
-        fields.append(_field(
-            "Equipment_Configuration", eq_cfg_src, "required",
-            eq_cfg_raw, eq_cfg_norm,
-            "hold",
-            f"Invalid value {eq_cfg_raw!r}. Allowed: Vessel, Jacketed Vessel, "
-            f"Heat Exchanger, Jacketed Vessel and Heat Exchanger",
-        ))
-        eq_cfg_display = eq_cfg_raw
-        config_hold = True
-    else:
-        fields.append(_required_pass("Equipment_Configuration", eq_cfg_src, eq_cfg_raw, eq_cfg_norm))
-        eq_cfg_display = eq_cfg_raw
-        config_hold = False
-
-    _log(f"[CPVerify] Equipment_Configuration: {eq_cfg_raw!r} valid={eq_cfg_valid}")
-
-    tube_active, jacket_active = _active_columns(eq_cfg_norm) if eq_cfg_valid else (False, False)
-
-    # ── Section C: Always required fields (excluding Equipment_Configuration) ──
-    always_required = [
-        "Drawing_Number",
-        "Tag_No",
-        "Serial_No",
-        "Description",
-        "Equipment_Type",
-        "Design_Code",
-        "Material_Code",
-        "Inspection_By",
-        "Revision",
-    ]
-    for prop in always_required:
-        v = _val(prop)
-        s = _src(prop)
-        if _is_blank(v):
-            fields.append(_missing(prop))
+        if _is_blank(eq_cfg_raw):
+            fields.append(_missing("Equipment_Configuration"))
+            eq_cfg_display = "unknown"
+            config_hold = True
+        elif not eq_cfg_valid:
+            fields.append(_field(
+                "Equipment_Configuration", eq_cfg_src, "required",
+                eq_cfg_raw, eq_cfg_norm,
+                "hold",
+                f"Invalid value {eq_cfg_raw!r}. Allowed: Vessel, Jacketed Vessel, "
+                f"Heat Exchanger, Jacketed Vessel and Heat Exchanger",
+            ))
+            eq_cfg_display = eq_cfg_raw
+            config_hold = True
         else:
-            fields.append(_required_pass(prop, s, v))
+            fields.append(_required_pass("Equipment_Configuration", eq_cfg_src, eq_cfg_raw, eq_cfg_norm))
+            eq_cfg_display = eq_cfg_raw
+            config_hold = False
 
-    # ── HYDRO_TEST_POSITION — required, enum: VERTICAL / HORIZONTAL ───────────
-    _htp_raw = _val("HYDRO_TEST_POSITION")
-    _htp_src = _src("HYDRO_TEST_POSITION")
-    if _is_blank(_htp_raw):
-        fields.append(_missing("HYDRO_TEST_POSITION"))
-    elif _norm_text(_htp_raw) not in _HYDRO_TEST_POSITION_VALUES:
-        fields.append(_required_fail(
-            "HYDRO_TEST_POSITION", _htp_src, _htp_raw,
-            f"Invalid value {_htp_raw!r}. Allowed: VERTICAL, HORIZONTAL",
-        ))
-    else:
-        fields.append(_required_pass(
-            "HYDRO_TEST_POSITION", _htp_src, _htp_raw,
-            _norm_text(_htp_raw).upper(),
-        ))
+        _log(f"[CPVerify] Section A — Equipment_Configuration: {eq_cfg_raw!r} valid={eq_cfg_valid}")
 
-    # ── Section B: Conditional IDP/MOT fields ─────────────────────────────────
-    # Shell — always required when equipment config is valid
-    for prop in ("SHELL_IDP", "SHELL_MOT"):
-        v = _val(prop)
-        s = _src(prop)
-        if config_hold:
-            fields.append(_required_hold(prop, s, v, "Equipment_Configuration invalid — cannot determine applicability"))
-        elif _is_blank(v):
-            fields.append(_missing(prop))
-        else:
-            norm = _norm_numeric(v) or v
-            fields.append(_required_pass(prop, s, v, norm))
+        tube_active, jacket_active = _active_columns(eq_cfg_norm) if eq_cfg_valid else (False, False)
 
-    # Tube — required only for Heat Exchanger / Jacketed Vessel and Heat Exchanger
-    for prop in ("TUBE_IDP", "TUBE_MOT"):
-        v = _val(prop)
-        s = _src(prop)
-        if config_hold:
-            fields.append(_required_hold(prop, s, v, "Equipment_Configuration invalid — cannot determine applicability"))
-        elif tube_active:
+        # ── Section C: Always required fields ─────────────────────────────────
+        always_required = [
+            "Drawing_Number",
+            "Tag_No",
+            "Serial_No",
+            "Description",
+            "Equipment_Type",
+            "Design_Code",
+            "Material_Code",
+            "Inspection_By",
+            "Revision",
+        ]
+        for prop in always_required:
+            v = _val(prop)
+            s = _src(prop)
             if _is_blank(v):
+                fields.append(_missing(prop))
+            else:
+                fields.append(_required_pass(prop, s, v))
+
+        # ── HYDRO_TEST_POSITION — required, enum: VERTICAL / HORIZONTAL ───────
+        _htp_raw = _val("HYDRO_TEST_POSITION")
+        _htp_src = _src("HYDRO_TEST_POSITION")
+        if _is_blank(_htp_raw):
+            fields.append(_missing("HYDRO_TEST_POSITION"))
+        elif _norm_text(_htp_raw) not in _HYDRO_TEST_POSITION_VALUES:
+            fields.append(_required_fail(
+                "HYDRO_TEST_POSITION", _htp_src, _htp_raw,
+                f"Invalid value {_htp_raw!r}. Allowed: VERTICAL, HORIZONTAL",
+            ))
+        else:
+            fields.append(_required_pass(
+                "HYDRO_TEST_POSITION", _htp_src, _htp_raw,
+                _norm_text(_htp_raw).upper(),
+            ))
+
+        # ── Section B: Conditional IDP/MOT fields ─────────────────────────────
+        for prop in ("SHELL_IDP", "SHELL_MOT"):
+            v = _val(prop)
+            s = _src(prop)
+            if config_hold:
+                fields.append(_required_hold(prop, s, v, "Equipment_Configuration invalid — cannot determine applicability"))
+            elif _is_blank(v):
                 fields.append(_missing(prop))
             else:
                 norm = _norm_numeric(v) or v
                 fields.append(_required_pass(prop, s, v, norm))
-        else:
-            # Not applicable — but if a value is present the drawing is wrong
-            if _is_blank(v):
-                fields.append(_not_applicable(prop, s, v))
-            else:
-                fields.append(_not_applicable_contaminated(prop, s, v, eq_cfg_display))
 
-    # Jacket — required only for Jacketed Vessel / Jacketed Vessel and Heat Exchanger
-    for prop in ("JACKET_IDP", "JACKET_MOT"):
-        v = _val(prop)
-        s = _src(prop)
-        if config_hold:
-            fields.append(_required_hold(prop, s, v, "Equipment_Configuration invalid — cannot determine applicability"))
-        elif jacket_active:
-            if _is_blank(v):
-                fields.append(_missing(prop))
+        for prop in ("TUBE_IDP", "TUBE_MOT"):
+            v = _val(prop)
+            s = _src(prop)
+            if config_hold:
+                fields.append(_required_hold(prop, s, v, "Equipment_Configuration invalid — cannot determine applicability"))
+            elif tube_active:
+                if _is_blank(v):
+                    fields.append(_missing(prop))
+                else:
+                    norm = _norm_numeric(v) or v
+                    fields.append(_required_pass(prop, s, v, norm))
             else:
-                norm = _norm_numeric(v) or v
-                fields.append(_required_pass(prop, s, v, norm))
-        else:
-            # Not applicable — but if a value is present the drawing is wrong
-            if _is_blank(v):
-                fields.append(_not_applicable(prop, s, v))
-            else:
-                fields.append(_not_applicable_contaminated(prop, s, v, eq_cfg_display))
+                if _is_blank(v):
+                    fields.append(_not_applicable(prop, s, v))
+                else:
+                    fields.append(_not_applicable_contaminated(prop, s, v, eq_cfg_display))
 
-    # ── Section D: Rule-based fields ──────────────────────────────────────────
+        for prop in ("JACKET_IDP", "JACKET_MOT"):
+            v = _val(prop)
+            s = _src(prop)
+            if config_hold:
+                fields.append(_required_hold(prop, s, v, "Equipment_Configuration invalid — cannot determine applicability"))
+            elif jacket_active:
+                if _is_blank(v):
+                    fields.append(_missing(prop))
+                else:
+                    norm = _norm_numeric(v) or v
+                    fields.append(_required_pass(prop, s, v, norm))
+            else:
+                if _is_blank(v):
+                    fields.append(_not_applicable(prop, s, v))
+                else:
+                    fields.append(_not_applicable_contaminated(prop, s, v, eq_cfg_display))
+
+    # ── Section D: Rule-based engineer fields ─────────────────────────────────
 
     # DrawnBy
     drawn_by = _val("DrawnBy")
     if _is_blank(drawn_by):
         fields.append(_missing("DrawnBy"))
+    elif drawn_by.strip().lower() == "agent":
+        fields.append(_required_hold("DrawnBy", _src("DrawnBy"), drawn_by,
+                                     "Auto-filled by Agent — is coming from Thermopac Drawing "
+                                     "Structuring Agent and requires human validation"))
     else:
         fields.append(_required_pass("DrawnBy", _src("DrawnBy"), drawn_by))
 
@@ -753,6 +769,10 @@ def verify_custom_properties(cp_extraction: dict, logger=None) -> dict:
     checked_by = _val("CheckedBy")
     if _is_blank(checked_by):
         fields.append(_missing("CheckedBy"))
+    elif checked_by.strip().lower() == "agent":
+        fields.append(_required_hold("CheckedBy", _src("CheckedBy"), checked_by,
+                                     "Auto-filled by Agent — is coming from Thermopac Drawing "
+                                     "Structuring Agent and requires human validation"))
     else:
         fields.append(_required_pass("CheckedBy", _src("CheckedBy"), checked_by))
 
@@ -778,6 +798,10 @@ def verify_custom_properties(cp_extraction: dict, logger=None) -> dict:
     eng_approval = _val("EngineeringApproval")
     if _is_blank(eng_approval):
         fields.append(_missing("EngineeringApproval"))
+    elif eng_approval.strip().lower() == "agent":
+        fields.append(_required_hold("EngineeringApproval", _src("EngineeringApproval"), eng_approval,
+                                     "Auto-filled by Agent — is coming from Thermopac Drawing "
+                                     "Structuring Agent and requires human validation"))
     else:
         fields.append(_required_pass("EngineeringApproval", _src("EngineeringApproval"), eng_approval))
 
@@ -799,132 +823,133 @@ def verify_custom_properties(cp_extraction: dict, logger=None) -> dict:
         fields.append(_required_pass("EngAppDate", _src("EngAppDate"), eng_app_date_raw,
                                      str(eng_app_date)))
 
-    # ── Section E: Mechanical column properties ───────────────────────────────
-    # SHELL always active; TUBE / JACKET follow Equipment_Configuration.
-    # _verify_mech_column handles column_active=False by marking each field
-    # not_applicable (blank) or contaminated-fail (unexpected value present).
-    _log("[CPVerify] Section E — mechanical column verification starting")
-    fields.extend(_verify_mech_column("SHELL",  resolved, True,         eq_cfg_display))
-    fields.extend(_verify_mech_column("TUBE",   resolved, tube_active,  eq_cfg_display))
-    fields.extend(_verify_mech_column("JACKET", resolved, jacket_active, eq_cfg_display))
-    _log(
-        f"[CPVerify] Section E complete — SHELL=active "
-        f"TUBE={'active' if tube_active else 'not_applicable'} "
-        f"JACKET={'active' if jacket_active else 'not_applicable'}"
-    )
+    if not ENABLE_ONLY_SECTION_D:
+        # ── Section E: Mechanical column properties ───────────────────────────
+        # SHELL always active; TUBE / JACKET follow Equipment_Configuration.
+        # _verify_mech_column handles column_active=False by marking each field
+        # not_applicable (blank) or contaminated-fail (unexpected value present).
+        _log("[CPVerify] Section E — mechanical column verification starting")
+        fields.extend(_verify_mech_column("SHELL",  resolved, True,         eq_cfg_display))
+        fields.extend(_verify_mech_column("TUBE",   resolved, tube_active,  eq_cfg_display))
+        fields.extend(_verify_mech_column("JACKET", resolved, jacket_active, eq_cfg_display))
+        _log(
+            f"[CPVerify] Section E complete — SHELL=active "
+            f"TUBE={'active' if tube_active else 'not_applicable'} "
+            f"JACKET={'active' if jacket_active else 'not_applicable'}"
+        )
 
-    # ── Section F: General Data properties ───────────────────────────────────
-    _log("[CPVerify] Section F — general data property verification starting")
+    if not ENABLE_ONLY_SECTION_D:
+        # ── Section F: General Data properties ───────────────────────────────
+        _log("[CPVerify] Section F — general data property verification starting")
 
-    # ── GENERAL_ORIENT — required enum: VERTICAL / HORIZONTAL ────────────────
-    _go_raw = _val("GENERAL_ORIENT")
-    _go_src = _src("GENERAL_ORIENT")
-    if _is_blank(_go_raw):
-        fields.append(_missing("GENERAL_ORIENT"))
-    elif _norm_text(_go_raw) not in _GENERAL_ORIENT_VALUES:
-        fields.append(_required_fail(
-            "GENERAL_ORIENT", _go_src, _go_raw,
-            f"Invalid value {_go_raw!r}. Allowed: VERTICAL, HORIZONTAL",
-        ))
-    else:
-        fields.append(_required_pass(
-            "GENERAL_ORIENT", _go_src, _go_raw,
-            _norm_text(_go_raw).upper(),
-        ))
-
-    # ── GENERAL_SERVICE_LIFE — optional, enum dropdown ────────────────────────
-    _gsl_raw = _val("GENERAL_SERVICE_LIFE")
-    _gsl_src = _src("GENERAL_SERVICE_LIFE")
-    if _is_blank(_gsl_raw):
-        fields.append(_opt_blank("GENERAL_SERVICE_LIFE"))
-    elif _norm_text(_gsl_raw) not in _GENERAL_SERVICE_LIFE_VALUES:
-        fields.append(_opt_hold(
-            "GENERAL_SERVICE_LIFE", _gsl_src, _gsl_raw,
-            f"Unrecognised service life {_gsl_raw!r}. "
-            "Expected one of: 5 years, 10 years, 15 years, 20 years, 25 years, 30 years",
-        ))
-    else:
-        fields.append(_opt_pass("GENERAL_SERVICE_LIFE", _gsl_src, _gsl_raw))
-
-    # ── GENERAL_WIND_CODE — optional, INFO free text ──────────────────────────
-    for _gf_prop in ("GENERAL_WIND_CODE", "GENERAL_WIND_VEL", "GENERAL_SEISMIC_CODE",
-                     "GENERAL_LOCATION"):
-        _gf_raw = _val(_gf_prop)
-        _gf_src = _src(_gf_prop)
-        if _is_blank(_gf_raw):
-            fields.append(_opt_blank(_gf_prop))
-        else:
-            fields.append(_opt_pass(_gf_prop, _gf_src, _gf_raw))
-
-    # ── GENERAL_SEISMIC_Z / _H / _V — optional, WARNING if non-numeric ───────
-    for _gs_prop in ("GENERAL_SEISMIC_Z", "GENERAL_SEISMIC_H", "GENERAL_SEISMIC_V"):
-        _gs_raw = _val(_gs_prop)
-        _gs_src = _src(_gs_prop)
-        if _is_blank(_gs_raw):
-            fields.append(_opt_blank(_gs_prop))
-        elif not _norm_numeric(_gs_raw):
-            fields.append(_opt_hold(
-                _gs_prop, _gs_src, _gs_raw,
-                f"{_gs_prop} must be numeric — {_gs_raw!r} is not a valid number",
+        # ── GENERAL_ORIENT — required enum: VERTICAL / HORIZONTAL ────────────
+        _go_raw = _val("GENERAL_ORIENT")
+        _go_src = _src("GENERAL_ORIENT")
+        if _is_blank(_go_raw):
+            fields.append(_missing("GENERAL_ORIENT"))
+        elif _norm_text(_go_raw) not in _GENERAL_ORIENT_VALUES:
+            fields.append(_required_fail(
+                "GENERAL_ORIENT", _go_src, _go_raw,
+                f"Invalid value {_go_raw!r}. Allowed: VERTICAL, HORIZONTAL",
             ))
         else:
-            fields.append(_opt_pass(_gs_prop, _gs_src, _gs_raw,
-                                    norm=_norm_numeric(_gs_raw)))
+            fields.append(_required_pass(
+                "GENERAL_ORIENT", _go_src, _go_raw,
+                _norm_text(_go_raw).upper(),
+            ))
 
-    # ── GENERAL_WEIGHT — optional, WARNING if W1/W2/W3 format invalid
-    #    or W1 > W2 (empty heavier than operating) or W2 > W3 (operating > test)
-    _gw_raw = _val("GENERAL_WEIGHT")
-    _gw_src = _src("GENERAL_WEIGHT")
-    if _is_blank(_gw_raw):
-        fields.append(_opt_blank("GENERAL_WEIGHT"))
-    else:
-        _gw_parts = _parse_three_slash(_gw_raw)
-        if _gw_parts is None:
+        # ── GENERAL_SERVICE_LIFE — optional, enum dropdown ────────────────────
+        _gsl_raw = _val("GENERAL_SERVICE_LIFE")
+        _gsl_src = _src("GENERAL_SERVICE_LIFE")
+        if _is_blank(_gsl_raw):
+            fields.append(_opt_blank("GENERAL_SERVICE_LIFE"))
+        elif _norm_text(_gsl_raw) not in _GENERAL_SERVICE_LIFE_VALUES:
             fields.append(_opt_hold(
-                "GENERAL_WEIGHT", _gw_src, _gw_raw,
-                f"Expected 'W1 / W2 / W3' (empty / operating / test) format — "
-                f"cannot parse {_gw_raw!r}",
+                "GENERAL_SERVICE_LIFE", _gsl_src, _gsl_raw,
+                f"Unrecognised service life {_gsl_raw!r}. "
+                "Expected one of: 5 years, 10 years, 15 years, 20 years, 25 years, 30 years",
             ))
         else:
-            _gw1, _gw2, _gw3 = _gw_parts
-            if _gw1 > _gw2:
+            fields.append(_opt_pass("GENERAL_SERVICE_LIFE", _gsl_src, _gsl_raw))
+
+        # ── GENERAL_WIND_CODE — optional, INFO free text ──────────────────────
+        for _gf_prop in ("GENERAL_WIND_CODE", "GENERAL_WIND_VEL", "GENERAL_SEISMIC_CODE",
+                         "GENERAL_LOCATION"):
+            _gf_raw = _val(_gf_prop)
+            _gf_src = _src(_gf_prop)
+            if _is_blank(_gf_raw):
+                fields.append(_opt_blank(_gf_prop))
+            else:
+                fields.append(_opt_pass(_gf_prop, _gf_src, _gf_raw))
+
+        # ── GENERAL_SEISMIC_Z / _H / _V — optional, WARNING if non-numeric ───
+        for _gs_prop in ("GENERAL_SEISMIC_Z", "GENERAL_SEISMIC_H", "GENERAL_SEISMIC_V"):
+            _gs_raw = _val(_gs_prop)
+            _gs_src = _src(_gs_prop)
+            if _is_blank(_gs_raw):
+                fields.append(_opt_blank(_gs_prop))
+            elif not _norm_numeric(_gs_raw):
                 fields.append(_opt_hold(
-                    "GENERAL_WEIGHT", _gw_src, _gw_raw,
-                    f"Empty weight ({_gw1}) must not exceed operating weight ({_gw2})",
-                ))
-            elif _gw2 > _gw3:
-                fields.append(_opt_hold(
-                    "GENERAL_WEIGHT", _gw_src, _gw_raw,
-                    f"Operating weight ({_gw2}) must not exceed test/hydro weight ({_gw3})",
+                    _gs_prop, _gs_src, _gs_raw,
+                    f"{_gs_prop} must be numeric — {_gs_raw!r} is not a valid number",
                 ))
             else:
-                fields.append(_opt_pass("GENERAL_WEIGHT", _gw_src, _gw_raw))
+                fields.append(_opt_pass(_gs_prop, _gs_src, _gs_raw,
+                                        norm=_norm_numeric(_gs_raw)))
 
-    # ── GENERAL_QTY — optional, WARNING if non-numeric or < 1 ───────────────
-    _gq_raw = _val("GENERAL_QTY")
-    _gq_src = _src("GENERAL_QTY")
-    if _is_blank(_gq_raw):
-        fields.append(_opt_blank("GENERAL_QTY"))
-    elif not _norm_numeric(_gq_raw):
-        fields.append(_opt_hold(
-            "GENERAL_QTY", _gq_src, _gq_raw,
-            f"GENERAL_QTY must be numeric — {_gq_raw!r} is not a valid number",
-        ))
-    else:
-        try:
-            _gq_num = float(_gq_raw)
-        except ValueError:
-            _gq_num = 0.0
-        if _gq_num < 1:
+        # ── GENERAL_WEIGHT — optional, WARNING if W1/W2/W3 format invalid ────
+        _gw_raw = _val("GENERAL_WEIGHT")
+        _gw_src = _src("GENERAL_WEIGHT")
+        if _is_blank(_gw_raw):
+            fields.append(_opt_blank("GENERAL_WEIGHT"))
+        else:
+            _gw_parts = _parse_three_slash(_gw_raw)
+            if _gw_parts is None:
+                fields.append(_opt_hold(
+                    "GENERAL_WEIGHT", _gw_src, _gw_raw,
+                    f"Expected 'W1 / W2 / W3' (empty / operating / test) format — "
+                    f"cannot parse {_gw_raw!r}",
+                ))
+            else:
+                _gw1, _gw2, _gw3 = _gw_parts
+                if _gw1 > _gw2:
+                    fields.append(_opt_hold(
+                        "GENERAL_WEIGHT", _gw_src, _gw_raw,
+                        f"Empty weight ({_gw1}) must not exceed operating weight ({_gw2})",
+                    ))
+                elif _gw2 > _gw3:
+                    fields.append(_opt_hold(
+                        "GENERAL_WEIGHT", _gw_src, _gw_raw,
+                        f"Operating weight ({_gw2}) must not exceed test/hydro weight ({_gw3})",
+                    ))
+                else:
+                    fields.append(_opt_pass("GENERAL_WEIGHT", _gw_src, _gw_raw))
+
+        # ── GENERAL_QTY — optional, WARNING if non-numeric or < 1 ────────────
+        _gq_raw = _val("GENERAL_QTY")
+        _gq_src = _src("GENERAL_QTY")
+        if _is_blank(_gq_raw):
+            fields.append(_opt_blank("GENERAL_QTY"))
+        elif not _norm_numeric(_gq_raw):
             fields.append(_opt_hold(
                 "GENERAL_QTY", _gq_src, _gq_raw,
-                f"GENERAL_QTY must be ≥ 1 — got {_gq_raw!r}",
+                f"GENERAL_QTY must be numeric — {_gq_raw!r} is not a valid number",
             ))
         else:
-            fields.append(_opt_pass("GENERAL_QTY", _gq_src, _gq_raw,
-                                    norm=_norm_numeric(_gq_raw)))
+            try:
+                _gq_num = float(_gq_raw)
+            except ValueError:
+                _gq_num = 0.0
+            if _gq_num < 1:
+                fields.append(_opt_hold(
+                    "GENERAL_QTY", _gq_src, _gq_raw,
+                    f"GENERAL_QTY must be ≥ 1 — got {_gq_raw!r}",
+                ))
+            else:
+                fields.append(_opt_pass("GENERAL_QTY", _gq_src, _gq_raw,
+                                        norm=_norm_numeric(_gq_raw)))
 
-    _log("[CPVerify] Section F complete — 11 GENERAL_* fields evaluated")
+        _log("[CPVerify] Section F complete — 11 GENERAL_* fields evaluated")
 
     # ── Overall status ────────────────────────────────────────────────────────
     # not_applicable fields do not count toward hold/fail/pass

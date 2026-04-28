@@ -131,6 +131,8 @@ def main():
     logger.info(f"[Structurer] Agent version: {STRUCTURER_VERSION}")
     logger.info(f"[Structurer] template_path: {config.structurer_template_path}")
     logger.info(f"[Structurer] staging_root:  {config.structurer_staging_root}")
+    from structurer.property_registry import registry_summary
+    logger.info(f"[Structurer] {registry_summary()}")
 
     client = StructureJobClient(
         config.api_url, config.node_id, config.node_token, logger
