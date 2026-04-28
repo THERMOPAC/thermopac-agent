@@ -30,10 +30,14 @@ def run_structure_job(
     logger,
 ) -> None:
     job_id = job["id"]
+    # Pending response uses camelCase; claim response uses snake_case.
+    # Read both so the initial log is correct regardless of which stage we're at.
+    _drawing_no = job.get('drawing_number') or job.get('drawingNumber')
+    _revision   = job.get('revision')
+    _mode       = job.get('mode') or job.get('mode', 'create_new')
     logger.info(
         f"[StructRunner] ══ Job {job_id} start ══ "
-        f"drawing={job.get('drawing_number')} rev={job.get('revision')} "
-        f"mode={job.get('mode', 'create_new')}"
+        f"drawing={_drawing_no} rev={_revision} mode={_mode}"
     )
 
     try:
